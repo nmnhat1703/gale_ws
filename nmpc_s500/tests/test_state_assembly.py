@@ -162,6 +162,24 @@ class TestStateAssembly(unittest.TestCase):
             atol=1e-9,
         )
 
+    def test_hover_yaw_param_is_stored_in_ned(self):
+        """Default ENU hover_yaw=0 faces east, which is NED yaw=pi/2."""
+        node = self._make_node()
+
+        np.testing.assert_allclose(node.hover_yaw_ned, np.pi / 2, atol=1e-9)
+
+    def test_publish_attitude_target_converts_solver_frd_rates_to_mavros_flu(self):
+        node = self._make_node()
+        solver_u = np.array([node.platform_cfg.mass_kg * 9.81, 0.0, 0.5, 0.0])
+
+        with patch("nmpc_s500.nmpc_node.rospy.Time.now", return_value=0.0):
+            node._publish_attitude_target(solver_u)
+
+        msg = node.attitude_pub.publish.call_args[0][0]
+        self.assertAlmostEqual(msg.body_rate.x, 0.0)
+        self.assertAlmostEqual(msg.body_rate.y, -0.5)
+        self.assertAlmostEqual(msg.body_rate.z, -0.0)
+
     def test_timestamp_guard_still_returns_none_for_unsynced_pose_velocity(self):
         node = self._make_node()
         node.pose = _pose_msg(1.0, 0.0, 0.0)

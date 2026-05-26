@@ -15,10 +15,12 @@ from nmpc_s500.frames import (
     enu_body_to_ned_body_rates,
     enu_to_ned_position,
     enu_to_ned_velocity,
+    enu_yaw_to_ned_yaw,
     flu_to_frd_quaternion,
     frd_to_flu_quaternion,
     ned_to_enu_position,
     quaternion_to_euler_zyx,
+    wrap_to_pi,
 )
 
 
@@ -46,8 +48,45 @@ class TestFrameTransforms(unittest.TestCase):
         np.testing.assert_allclose(rates_enu, (0.1, 0.2, 0.3), atol=1e-9)
 
     def test_body_rate_formula(self):
-        """FLU body rates (p, q, r) map to FRD (p, -q, -r)."""
+        """Body-rate axis flip: (p, q, r) -> (p, -q, -r). Used for both FLU<->FRD."""
         self.assertEqual(enu_body_to_ned_body_rates(0.1, 0.2, 0.3), (0.1, -0.2, -0.3))
+
+    def test_enu_yaw_zero_maps_to_ned_yaw_pi_over_two(self):
+        """ENU yaw 0 faces east; the same physical heading is NED yaw pi/2."""
+        np.testing.assert_allclose(enu_yaw_to_ned_yaw(0.0), np.pi / 2, atol=1e-9)
+
+    def test_enu_yaw_north_maps_to_ned_yaw_zero(self):
+        """ENU yaw pi/2 faces north; the same physical heading is NED yaw 0."""
+        np.testing.assert_allclose(enu_yaw_to_ned_yaw(np.pi / 2), 0.0, atol=1e-9)
+
+    def test_enu_yaw_west_maps_to_ned_yaw_negative_pi_over_two(self):
+        """ENU yaw pi faces west; the same physical heading is NED yaw -pi/2."""
+        np.testing.assert_allclose(enu_yaw_to_ned_yaw(np.pi), -np.pi / 2, atol=1e-9)
+
+    def test_enu_yaw_south_wraps_to_negative_pi(self):
+        """ENU yaw -pi/2 faces south; wrap_to_pi normalizes +pi to -pi."""
+        np.testing.assert_allclose(enu_yaw_to_ned_yaw(-np.pi / 2), -np.pi, atol=1e-9)
+
+    def test_enu_yaw_to_ned_yaw_is_self_inverse_for_non_boundary_values(self):
+        """Strictly interior yaw values round-trip exactly."""
+        for yaw in [-np.pi / 2, 0.0, np.pi / 4, np.pi / 2]:
+            round_trip = enu_yaw_to_ned_yaw(enu_yaw_to_ned_yaw(yaw))
+            np.testing.assert_allclose(round_trip, yaw, atol=1e-9)
+
+    def test_enu_yaw_to_ned_yaw_boundary_values_use_negative_pi(self):
+        """Boundary yaw values round-trip to the canonical -pi representative."""
+        for yaw in [-np.pi, np.pi]:
+            round_trip = enu_yaw_to_ned_yaw(enu_yaw_to_ned_yaw(yaw))
+            np.testing.assert_allclose(round_trip, -np.pi, atol=1e-9)
+
+    def test_wrap_to_pi(self):
+        """wrap_to_pi normalizes angles to [-pi, pi] with -pi as the boundary."""
+        np.testing.assert_allclose(wrap_to_pi(3 * np.pi), -np.pi, atol=1e-9)
+        np.testing.assert_allclose(wrap_to_pi(-3 * np.pi), -np.pi, atol=1e-9)
+        np.testing.assert_allclose(wrap_to_pi(np.pi), -np.pi, atol=1e-9)
+        np.testing.assert_allclose(wrap_to_pi(-np.pi), -np.pi, atol=1e-9)
+        np.testing.assert_allclose(wrap_to_pi(0.0), 0.0, atol=1e-9)
+        np.testing.assert_allclose(wrap_to_pi(np.pi / 2), np.pi / 2, atol=1e-9)
 
     def test_quaternion_identity_mapping(self):
         """ENU/FLU identity maps to a 90-degree yaw in NED/FRD convention."""

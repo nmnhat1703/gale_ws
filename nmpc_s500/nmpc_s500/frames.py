@@ -39,6 +39,21 @@ def enu_to_ned_velocity(vx: float, vy: float, vz: float) -> Tuple[float, float, 
     return vy, vx, -vz
 
 
+def wrap_to_pi(angle: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def enu_yaw_to_ned_yaw(yaw_enu: float) -> float:
+    """Convert an ENU yaw to a NED yaw.
+
+    ENU yaw is rotation about +Z up, 0 = +X east. NED yaw is rotation
+    about +Z down, 0 = +X north. Result is wrapped to [-pi, pi].
+    Formula: yaw_ned = pi/2 - yaw_enu. This is an involution.
+    """
+    return wrap_to_pi(np.pi / 2.0 - yaw_enu)
+
+
 def enu_body_to_ned_body_rates(p: float, q: float, r: float) -> Tuple[float, float, float]:
     """Convert FLU body rates to FRD body rates. This transform is self-inverse."""
     return p, -q, -r

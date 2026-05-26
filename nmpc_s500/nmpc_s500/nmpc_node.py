@@ -22,9 +22,12 @@ from mavros_msgs.srv import CommandBool, SetMode
 
 from nmpc_s500.platform_config import load_platform_config
 from nmpc_s500.solver_setup import create_solver
+# TODO: rename to flip_body_rates_frd_flu - name says world frame, function operates on body frame.
 from nmpc_s500.frames import (
+    enu_body_to_ned_body_rates,
     enu_to_ned_position,
     enu_to_ned_velocity,
+    enu_yaw_to_ned_yaw,
     flu_to_frd_quaternion,
     quaternion_to_euler_zyx,
 )
@@ -53,6 +56,15 @@ MAX_CONSECUTIVE_SOLVER_FAILURES = 10
 # Default horizon parameters
 DEFAULT_HORIZON = 2.0
 DEFAULT_NUM_STEPS = 50
+
+ACADOS_STATUS_LABELS = {
+    -1: "EXCEPTION",
+    0: "OK",
+    1: "MAX_ITER",
+    2: "NAN",
+    3: "QP_FAIL",
+    4: "QP_MAX_ITER",
+}
 
 
 class FlightPhase(Enum):
@@ -84,13 +96,21 @@ class NmpcNode:
             enu_to_ned_position(hover_pos_enu[0], hover_pos_enu[1], hover_pos_enu[2]),
             dtype=float,
         )
-        self.hover_yaw = rospy.get_param('~hover_yaw', 0.0)
+        # ROS param is ENU yaw (0 = east). Convert at capture so
+        # self.hover_yaw_ned is always solver-frame NED yaw, wrapped to [-pi, pi].
+        hover_yaw_enu = rospy.get_param('~hover_yaw', 0.0)
+        self.hover_yaw_ned = enu_yaw_to_ned_yaw(hover_yaw_enu)
         self.enable_offboard_on_start = rospy.get_param('~enable_offboard_on_start', False)
 
         rospy.loginfo(f"[NMPC] Platform: {platform_name}")
         rospy.loginfo(f"[NMPC] Control rate: {self.control_rate_hz} Hz")
         rospy.loginfo(
             f"[NMPC] Hover position (ENU param): {hover_pos_enu} -> NED: {self.hover_position_ned}"
+        )
+        rospy.loginfo(
+            f"[NMPC] Hover yaw (ENU param): {hover_yaw_enu:+.3f} rad "
+            f"({np.degrees(hover_yaw_enu):+.1f} deg) -> NED: {self.hover_yaw_ned:+.3f} rad "
+            f"({np.degrees(self.hover_yaw_ned):+.1f} deg)"
         )
         rospy.loginfo(f"[NMPC] Enable OFFBOARD on start: {self.enable_offboard_on_start}")
 
@@ -309,8 +329,11 @@ class NmpcNode:
     def _publish_attitude_target(self, u):
         """Publish attitude setpoint with body rates and thrust.
 
+        Input u is in solver/FRD frame. Body-rate conversion to MAVROS FLU
+        happens inside this method immediately before publishing.
+
         Args:
-            u (np.ndarray): [thrust_N, p, q, r] from solver
+            u (np.ndarray): [thrust_N, p, q, r] in solver/FRD frame
         """
         msg = AttitudeTarget()
         msg.header.stamp = rospy.Time.now()
@@ -325,10 +348,14 @@ class NmpcNode:
         msg.orientation.y = 0.0
         msg.orientation.z = 0.0
 
-        # Body rates [p, q, r] in rad/s (directly from solver)
-        msg.body_rate.x = u[1]
-        msg.body_rate.y = u[2]
-        msg.body_rate.z = u[3]
+        # Body rates: solver outputs FRD (p, q, r); mavros expects FLU.
+        # The transform (p, q, r) -> (p, -q, -r) is self-inverse.
+        # mavros internally converts FLU -> FRD before sending
+        # SET_ATTITUDE_TARGET to PX4 (see setpoint_raw.cpp::attitude_cb).
+        p_flu, q_flu, r_flu = enu_body_to_ned_body_rates(u[1], u[2], u[3])
+        msg.body_rate.x = p_flu
+        msg.body_rate.y = q_flu
+        msg.body_rate.z = r_flu
 
         # Thrust: normalize [0, max_thrust_n] N to [0, 1]
         thrust_normalised = np.clip(
@@ -392,7 +419,7 @@ class NmpcNode:
             ref_per_stage = np.hstack((
                 self.hover_position_ned,                # 3: position (NED)
                 [0.0, 0.0, 0.0],                        # 3: velocity
-                [0.0, 0.0, self.hover_yaw],             # 3: euler (yaw only)
+                [0.0, 0.0, self.hover_yaw_ned],         # 3: euler (yaw only, NED)
             ))                                          # = 9D
             x_ref = np.tile(ref_per_stage, (DEFAULT_NUM_STEPS, 1))
 
@@ -526,7 +553,7 @@ class NmpcNode:
         ref_per_stage = np.hstack((
             self.hover_position_ned,                # 3: position (NED)
             [0.0, 0.0, 0.0],                        # 3: velocity
-            [0.0, 0.0, self.hover_yaw],             # 3: euler (yaw only)
+            [0.0, 0.0, self.hover_yaw_ned],         # 3: euler (yaw only, NED)
         ))                                          # = 9D
         x_ref = np.tile(ref_per_stage, (DEFAULT_NUM_STEPS, 1))
 
@@ -544,13 +571,13 @@ class NmpcNode:
 
         # Handle solver status
         use_solution = self._handle_solver_status(status)
+        publish_solution = use_solution and u_optimal is not None
+        u_to_publish = u_optimal if publish_solution else self.last_control_input
 
-        if use_solution and u_optimal is not None:
+        if publish_solution:
             # Update last control for warm-start
             self.last_control_input = u_optimal
             self.consecutive_solver_failures = 0
-            # Publish solution
-            self._publish_attitude_target(u_optimal)
         else:
             # Hold last good command
             self.consecutive_solver_failures += 1
@@ -558,13 +585,43 @@ class NmpcNode:
                 5.0,
                 f"[NMPC] Using last control (failure #{self.consecutive_solver_failures})"
             )
-            self._publish_attitude_target(self.last_control_input)
 
-            # Switch to safe hover after too many failures
-            if self.consecutive_solver_failures >= MAX_CONSECUTIVE_SOLVER_FAILURES:
-                rospy.logerr("[NMPC] Too many solver failures, switching to safe hover")
-                self._publish_safe_hover()
-                # Can add a recovery strategy here if needed
+        # Diagnostic status for live SITL debugging.
+        # State is solver-frame: position/velocity NED, Euler ZYX [roll, pitch, yaw].
+        # u_to_publish is solver-frame FRD: [thrust_N, p, q, r in rad/s].
+        # Must match the conversion in _publish_attitude_target; update both if changed.
+        p_flu, q_flu, r_flu = enu_body_to_ned_body_rates(
+            u_to_publish[1], u_to_publish[2], u_to_publish[3]
+        )
+        status_str = ACADOS_STATUS_LABELS.get(status, f"UNKNOWN({status})")
+        rospy.loginfo_throttle(
+            1.0,
+            "[NMPC] RUN diag: "
+            f"status={status_str} use_solution={publish_solution} "
+            f"failures={self.consecutive_solver_failures} "
+            f"solve_ms={solve_time * 1000.0:.1f} "
+            f"pos_ned_m=[{x_now[0]:+.2f},{x_now[1]:+.2f},{x_now[2]:+.2f}] "
+            f"vel_ned_mps=[{x_now[3]:+.2f},{x_now[4]:+.2f},{x_now[5]:+.2f}] "
+            f"rpy_ned_deg=[{np.degrees(x_now[6]):+.1f},"
+            f"{np.degrees(x_now[7]):+.1f},{np.degrees(x_now[8]):+.1f}] "
+            f"u_frd=[T={u_to_publish[0]:+.2f}N,"
+            f"p={np.degrees(u_to_publish[1]):+.1f},"
+            f"q={np.degrees(u_to_publish[2]):+.1f},"
+            f"r={np.degrees(u_to_publish[3]):+.1f}]degps "
+            f"rates_flu_degps=[{np.degrees(p_flu):+.1f},"
+            f"{np.degrees(q_flu):+.1f},{np.degrees(r_flu):+.1f}]"
+        )
+
+        self._publish_attitude_target(u_to_publish)
+
+        # Switch to safe hover after too many failures
+        if (
+            not publish_solution
+            and self.consecutive_solver_failures >= MAX_CONSECUTIVE_SOLVER_FAILURES
+        ):
+            rospy.logerr("[NMPC] Too many solver failures, switching to safe hover")
+            self._publish_safe_hover()
+            # Can add a recovery strategy here if needed
 
         return FlightPhase.RUN
 
