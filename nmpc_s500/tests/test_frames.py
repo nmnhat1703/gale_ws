@@ -73,6 +73,73 @@ class TestFrameTransforms(unittest.TestCase):
         rpy = quaternion_to_euler_zyx(*q_ned_frd)
         np.testing.assert_allclose(rpy, [0.0, 0.0, np.pi / 2], atol=1e-9)
 
+    def test_drone_facing_north_level(self):
+        """Drone facing north in ENU/FLU = identity in NED/FRD."""
+        # ENU/FLU: drone forward (FLU+x) points to ENU+y (north).
+        # That's +90° rotation about ENU+z (up).
+        q_enu_flu = Rotation.from_euler('z', np.pi / 2, degrees=False).as_quat()
+        # NED/FRD: drone forward (FRD+x) points to NED+x (north). Identity.
+        q_ned_frd_expected = np.array([0.0, 0.0, 0.0, 1.0])
+
+        q_ned_frd_actual = np.array(flu_to_frd_quaternion(*q_enu_flu))
+
+        # Handle sign ambiguity (q and -q represent the same rotation)
+        if np.dot(q_ned_frd_actual, q_ned_frd_expected) < 0.0:
+            q_ned_frd_actual = -q_ned_frd_actual
+        np.testing.assert_allclose(q_ned_frd_actual, q_ned_frd_expected, atol=1e-9)
+
+    def test_drone_facing_east_rolled_right(self):
+        """Drone facing east in ENU/FLU, rolled +30° right.
+
+        ENU/FLU: identity heading (facing east) composed with +30° roll
+        about FLU+x (forward). Roll-right means right wing drops; in FLU
+        this is positive rotation about +x.
+        NED/FRD: yaw=+90° about NED+z (facing east) composed with +30°
+        roll about FRD+x (forward). Roll-right is positive rotation about
+        FRD+x.
+        """
+        # Build q_enu_flu: identity * Rx(+30°) — order matters; this is
+        # body-frame composition, so Rx is applied first in the body.
+        # Using scipy intrinsic xyz with only x component:
+        q_enu_flu = Rotation.from_euler('x', np.pi / 6, degrees=False).as_quat()
+
+        # Build q_ned_frd: yaw +90° about z, then +30° roll about x (body).
+        # Using intrinsic ZYX (yaw, pitch, roll):
+        q_ned_frd_expected = Rotation.from_euler(
+            'ZYX', [np.pi / 2, 0.0, np.pi / 6], degrees=False
+        ).as_quat()
+
+        q_ned_frd_actual = np.array(flu_to_frd_quaternion(*q_enu_flu))
+
+        if np.dot(q_ned_frd_actual, q_ned_frd_expected) < 0.0:
+            q_ned_frd_actual = -q_ned_frd_actual
+        np.testing.assert_allclose(q_ned_frd_actual, q_ned_frd_expected, atol=1e-9)
+
+    def test_drone_facing_east_pitched_up(self):
+        """Drone facing east in ENU/FLU, pitched +20° nose-up.
+
+        ENU/FLU: identity heading (facing east) composed with +20° pitch
+        about FLU+y (left). Nose-up means the nose rises; in FLU, where +y
+        is left, this is +20° about +y (right-hand rule: thumb left, fingers
+        curl up at the front).
+        NED/FRD: yaw=+90° about NED+z (facing east) composed with +20°
+        pitch about FRD+y (right). Nose-up in FRD, where +y is right and
+        +z is down, is +20° about FRD+y (right-hand rule: thumb right,
+        fingers curl forward-up).
+        """
+        # Nose-up in ENU/FLU is NEGATIVE rotation about FLU+y (since +y is left
+        # and right-hand rule about +y rotates forward toward down).
+        q_enu_flu = Rotation.from_euler('y', -np.pi / 9, degrees=False).as_quat()
+        q_ned_frd_expected = Rotation.from_euler(
+            'ZYX', [np.pi / 2, np.pi / 9, 0.0], degrees=False
+        ).as_quat()
+
+        q_ned_frd_actual = np.array(flu_to_frd_quaternion(*q_enu_flu))
+
+        if np.dot(q_ned_frd_actual, q_ned_frd_expected) < 0.0:
+            q_ned_frd_actual = -q_ned_frd_actual
+        np.testing.assert_allclose(q_ned_frd_actual, q_ned_frd_expected, atol=1e-9)
+
 
 class TestQuaternionToEulerZYX(unittest.TestCase):
     """Test quaternion to ZYX Euler angle conversion."""

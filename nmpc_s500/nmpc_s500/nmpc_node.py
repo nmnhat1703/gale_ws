@@ -25,6 +25,7 @@ from nmpc_s500.solver_setup import create_solver
 from nmpc_s500.frames import (
     enu_to_ned_position,
     enu_to_ned_velocity,
+    flu_to_frd_quaternion,
     quaternion_to_euler_zyx,
 )
 
@@ -235,9 +236,12 @@ class NmpcNode:
             self.velocity.twist.linear.z,
         ))
 
-        # Extract quaternion and convert to Euler (ZYX)
+        # Extract quaternion (FLU body relative to ENU world, from MAVROS).
+        # Convert to FRD body relative to NED world for the solver, then to
+        # ZYX Euler angles [roll, pitch, yaw].
         q = self.pose.pose.orientation
-        euler = quaternion_to_euler_zyx(q.x, q.y, q.z, q.w)
+        q_frd = flu_to_frd_quaternion(q.x, q.y, q.z, q.w)
+        euler = quaternion_to_euler_zyx(*q_frd)
 
         # Build state vector
         x = np.hstack((p, v, euler))
