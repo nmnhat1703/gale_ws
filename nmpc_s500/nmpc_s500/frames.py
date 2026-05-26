@@ -71,19 +71,19 @@ def frd_to_flu_quaternion(qx: float, qy: float, qz: float, qw: float) -> Tuple[f
 
 
 def quaternion_to_euler_zyx(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
-    """Convert quaternion to intrinsic ZYX Euler angles.
+    """Convert quaternion to [roll, pitch, yaw] matching the NMPC model convention.
 
-    Returns: numpy array [roll, pitch, yaw] where:
-      - roll  = rotation about body X (first applied)
-      - pitch = rotation about body Y
-      - yaw   = rotation about body Z (last applied)
+    The upstream NMPC model (acados_model.py) builds the world-to-body
+    rotation as:
+        R_world_body = Rz(yaw) @ Ry(pitch) @ Rx(roll)
 
-    This matches the upstream acados_model.py convention:
-      R_world_body = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+    This corresponds to scipy's intrinsic ZYX rotation, which is
+    mathematically equivalent to extrinsic xyz. We use as_euler('xyz')
+    because it returns [roll, pitch, yaw] directly in the desired order.
 
-    NOTE: scipy's as_euler('zyx') returns [z_angle, y_angle, x_angle]
-    = [yaw, pitch, roll]. We reverse to [roll, pitch, yaw] for clarity
-    and to match the upstream state vector convention.
+    IMPORTANT: as_euler('zyx') would return [yaw, pitch, roll] for a
+    DIFFERENT decomposition (extrinsic zyx = intrinsic xyz) that does
+    NOT match the model's rotation formula when yaw and roll/pitch are
+    simultaneously non-zero.
     """
-    zyx = Rotation.from_quat([qx, qy, qz, qw]).as_euler('zyx', degrees=False)
-    return np.array([zyx[2], zyx[1], zyx[0]])
+    return Rotation.from_quat([qx, qy, qz, qw]).as_euler('xyz', degrees=False)

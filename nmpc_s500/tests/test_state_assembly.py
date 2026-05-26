@@ -1,4 +1,4 @@
-"""Integration checks for C1 ENU->NED position/velocity handling."""
+"""Integration checks for NMPC state-vector assembly."""
 
 import unittest
 from contextlib import ExitStack
@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from nmpc_s500.nmpc_node import NmpcNode, POSE_VEL_SYNC_THRESHOLD_S
 
@@ -27,7 +28,7 @@ def _velocity_msg(vx, vy, vz):
     )
 
 
-class TestC1Integration(unittest.TestCase):
+class TestStateAssembly(unittest.TestCase):
     """Exercise NmpcNode._build_state_vector without a running ROS master."""
 
     def _make_node(self):
@@ -72,6 +73,7 @@ class TestC1Integration(unittest.TestCase):
             return NmpcNode()
 
     def test_pure_east_position_and_velocity_convert_to_ned_y(self):
+        """Pure ENU east maps to NED +y; FLU/ENU identity means NED yaw=pi/2."""
         node = self._make_node()
         node.pose = _pose_msg(1.0, 0.0, 0.0)
         node.velocity = _velocity_msg(2.0, 0.0, 0.0)
@@ -82,11 +84,12 @@ class TestC1Integration(unittest.TestCase):
 
         np.testing.assert_allclose(
             state,
-            [0.0, 1.0, -0.0, 0.0, 2.0, -0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, -0.0, 0.0, 2.0, -0.0, 0.0, 0.0, np.pi / 2],
             atol=1e-9,
         )
 
     def test_pure_up_position_and_velocity_convert_to_ned_down_negative(self):
+        """Pure ENU up maps to NED -z; FLU/ENU identity means NED yaw=pi/2."""
         node = self._make_node()
         node.pose = _pose_msg(0.0, 0.0, 1.5)
         node.velocity = _velocity_msg(0.0, 0.0, 0.5)
@@ -97,9 +100,58 @@ class TestC1Integration(unittest.TestCase):
 
         np.testing.assert_allclose(
             state,
-            [0.0, 0.0, -1.5, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.5, 0.0, 0.0, -0.5, 0.0, 0.0, np.pi / 2],
             atol=1e-9,
         )
+
+    def test_drone_facing_north_level_produces_zero_yaw(self):
+        """Drone facing north in ENU/FLU should have yaw=0 in NED/FRD state."""
+        node = self._make_node()
+        q = Rotation.from_euler('z', np.pi / 2, degrees=False).as_quat()
+        node.pose = _pose_msg(0.0, 0.0, 0.0, qx=q[0], qy=q[1], qz=q[2], qw=q[3])
+        node.velocity = _velocity_msg(0.0, 0.0, 0.0)
+        node.pose_timestamp = 10.0
+        node.vel_timestamp = 10.0
+
+        state = node._build_state_vector()
+
+        np.testing.assert_allclose(state[6:9], [0.0, 0.0, 0.0], atol=1e-9)
+
+    def test_drone_east_rolled_right_produces_positive_roll(self):
+        """Drone facing east in ENU/FLU, rolled +30° right.
+
+        Identity in FLU/ENU = facing east (yaw=+pi/2 in NED/FRD).
+        Roll right is +30° about FLU+x. In FRD/NED solver frame
+        this is roll=+pi/6, pitch=0, yaw=+pi/2.
+        """
+        node = self._make_node()
+        q = Rotation.from_euler('x', np.pi / 6, degrees=False).as_quat()
+        node.pose = _pose_msg(0.0, 0.0, 0.0, qx=q[0], qy=q[1], qz=q[2], qw=q[3])
+        node.velocity = _velocity_msg(0.0, 0.0, 0.0)
+        node.pose_timestamp = 10.0
+        node.vel_timestamp = 10.0
+
+        state = node._build_state_vector()
+
+        np.testing.assert_allclose(state[6:9], [np.pi / 6, 0.0, np.pi / 2], atol=1e-9)
+
+    def test_drone_east_pitched_up_produces_positive_pitch(self):
+        """Drone facing east in ENU/FLU, pitched 20° nose-up.
+
+        Nose-up in FLU is NEGATIVE rotation about FLU+y (since +y is
+        left and right-hand rule about +y rotates forward toward down).
+        In FRD/NED solver frame this is roll=0, pitch=+pi/9, yaw=+pi/2.
+        """
+        node = self._make_node()
+        q = Rotation.from_euler('y', -np.pi / 9, degrees=False).as_quat()
+        node.pose = _pose_msg(0.0, 0.0, 0.0, qx=q[0], qy=q[1], qz=q[2], qw=q[3])
+        node.velocity = _velocity_msg(0.0, 0.0, 0.0)
+        node.pose_timestamp = 10.0
+        node.vel_timestamp = 10.0
+
+        state = node._build_state_vector()
+
+        np.testing.assert_allclose(state[6:9], [0.0, np.pi / 9, np.pi / 2], atol=1e-9)
 
     def test_hover_position_param_is_stored_in_ned(self):
         node = self._make_node()
