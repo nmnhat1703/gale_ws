@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>nmpc_s500</name>
+  <version>0.1.0</version>
+  <description>ROS 1 NMPC controller for S500 quadrotor with MAVROS, adapted from evannsmc/nmpc_acados_px4</description>
+  <maintainer email="nicktaonemay@gmail.com">nhat</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- ROS 1 runtime dependencies -->
+  <depend>rospy</depend>
+  <depend>mavros_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <!-- Python dependencies (via pip or system packages) -->
+  <depend>python3-numpy</depend>
+  <depend>python3-scipy</depend>
+  <depend>python3-yaml</depend>
+
+  <!-- Test dependencies -->
+  <test_depend>python3-pytest</test_depend>
+
+  <author email="egmc@todo.todo">evannsmc (upstream)</author>
+
+</package>

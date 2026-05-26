@@ -1,0 +1,15 @@
+<launch>
+  <!-- ASSUMES: MAVROS already running on hardware via your standard
+       flight launch file. This launch only starts the NMPC node.
+       OFFBOARD must be engaged manually via RC switch. -->
+
+  <node name="nmpc_node" pkg="nmpc_s500" type="nmpc_node.py"
+        output="screen" required="true">
+    <param name="platform" value="real_s500" />
+    <param name="trajectory" value="hover" />
+    <rosparam param="hover_position">[0.0, 0.0, 1.0]</rosparam>
+    <param name="hover_yaw" value="0.0" />
+    <param name="control_rate_hz" value="50" />
+    <param name="enable_offboard_on_start" value="false" />
+  </node>
+</launch>

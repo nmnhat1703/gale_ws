@@ -1,0 +1,15 @@
+<launch>
+  <!-- ASSUMES: PX4 SITL + Gazebo + MAVROS already running, started
+       by /home/nhat/PX4-Autopilot/launch/run_px4_sitl.sh. This
+       launch only starts the NMPC node. -->
+
+  <node name="nmpc_node" pkg="nmpc_s500" type="nmpc_node.py"
+        output="screen" required="true">
+    <param name="platform" value="sim_iris" />
+    <param name="trajectory" value="hover" />
+    <rosparam param="hover_position">[0.0, 0.0, 1.5]</rosparam>
+    <param name="hover_yaw" value="0.0" />
+    <param name="control_rate_hz" value="50" />
+    <param name="enable_offboard_on_start" value="true" />
+  </node>
+</launch>

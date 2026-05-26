@@ -1,0 +1,33 @@
+# Platform configuration presets for NMPC solver and controller
+# Each preset defines mass, max thrust, inertia, and other platform-specific parameters.
+
+sim_iris:
+  # Gazebo Classic iris (stock model)
+  mass_kg: 1.5
+  max_thrust_n: 22.8  # 4 motors * ~5.7 N each
+  # ASSUMPTION: iris inertia values are CAD estimates for the standard Gazebo iris model
+  Ixx: 0.029
+  Iyy: 0.029
+  Izz: 0.055
+  max_body_rate: 0.8  # rad/s
+  hover_thrust_normalised: 0.65  # PX4 MPC_THR_HOVER default for iris
+
+# Avenger 3120-700KV propulsion. Mass measured. max_thrust_n derived
+# from measured HTE = 0.196 from flight 29. Re-validate HTE on a
+# non-saturated range (set MPC_THR_HOVER=0.4, HTE_THR_RANGE=0.4 before
+# the validation flight) before trusting this for aggressive trajectories.
+# Battery cell count assumed consistent between the HTE flight and
+# any future flights — if you change battery (e.g. 6S to 8S), max_thrust_n
+# must be recomputed.
+real_s500:
+  # Custom S500 quadrotor with Hesai JT128 LiDAR and Microstrain 3DM-CV7 IMU
+  mass_kg: 2.7  # measured: LiDAR + battery + IMU payload
+  # max_thrust_n derived: 2.7 kg * 9.81 m/s² / 0.196 = 135.0 N
+  max_thrust_n: 135.0
+  # Inertia values: CAD estimates, not used in OCP. Kept for future use (e.g. rate damping).
+  # Will be refined via system ID or auto-tune (Phase 3).
+  Ixx: 0.029
+  Iyy: 0.029
+  Izz: 0.055
+  max_body_rate: 0.8  # rad/s
+  hover_thrust_normalised: 0.196  # measured from flight 29 HTE convergence

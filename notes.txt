@@ -1,0 +1,3 @@
+Need to config the config.yaml file to correct lidar model "lidar_type: RSAIRY", also change the ip address of jetson correct with the default address of robosense which is 192.168.1.102 (also check the host_address: 192.168.1.102 in the config.yaml)
+
+Change set(POINT_TYPE XYZIRT) in the CMakelist file of package to get the data with time ring
