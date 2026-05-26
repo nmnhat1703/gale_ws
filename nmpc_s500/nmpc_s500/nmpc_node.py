@@ -101,6 +101,9 @@ class NmpcNode:
         hover_yaw_enu = rospy.get_param('~hover_yaw', 0.0)
         self.hover_yaw_ned = enu_yaw_to_ned_yaw(hover_yaw_enu)
         self.enable_offboard_on_start = rospy.get_param('~enable_offboard_on_start', False)
+        # Diagnostic logging period in seconds. Default 1.0 (1 Hz human-readable).
+        # Drop to ~0.2 for SITL tuning to get 5 Hz time-series.
+        self.diag_log_period_sec = rospy.get_param('~diag_log_period_sec', 1.0)
 
         rospy.loginfo(f"[NMPC] Platform: {platform_name}")
         rospy.loginfo(f"[NMPC] Control rate: {self.control_rate_hz} Hz")
@@ -112,6 +115,7 @@ class NmpcNode:
             f"({np.degrees(hover_yaw_enu):+.1f} deg) -> NED: {self.hover_yaw_ned:+.3f} rad "
             f"({np.degrees(self.hover_yaw_ned):+.1f} deg)"
         )
+        rospy.loginfo(f"[NMPC] Diagnostic log period: {self.diag_log_period_sec:.2f} s")
         rospy.loginfo(f"[NMPC] Enable OFFBOARD on start: {self.enable_offboard_on_start}")
 
         # ===== Load Platform Config =====
@@ -595,7 +599,7 @@ class NmpcNode:
         )
         status_str = ACADOS_STATUS_LABELS.get(status, f"UNKNOWN({status})")
         rospy.loginfo_throttle(
-            1.0,
+            self.diag_log_period_sec,
             "[NMPC] RUN diag: "
             f"status={status_str} use_solution={publish_solution} "
             f"failures={self.consecutive_solver_failures} "
