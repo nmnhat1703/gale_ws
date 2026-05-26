@@ -4,13 +4,16 @@
 sim_iris:
   # Gazebo Classic iris (stock model)
   mass_kg: 1.5
-  max_thrust_n: 22.8  # 4 motors * ~5.7 N each
+  # Calibrated from SITL hover logs: old max_thrust_n=22.8 and steady hover
+  # command ~16.1 N -> normalized thrust ~0.706. For mass 1.5 kg, m*g=14.7 N,
+  # so max_thrust_n ~= 14.7 / 0.706 = 20.8 N.
+  max_thrust_n: 20.8
   # ASSUMPTION: iris inertia values are CAD estimates for the standard Gazebo iris model
   Ixx: 0.029
   Iyy: 0.029
   Izz: 0.055
   max_body_rate: 0.8  # rad/s
-  hover_thrust_normalised: 0.65  # PX4 MPC_THR_HOVER default for iris
+  hover_thrust_normalised: 0.707
 
 # Avenger 3120-700KV propulsion. Mass measured. max_thrust_n derived
 # from measured HTE = 0.196 from flight 29. Re-validate HTE on a

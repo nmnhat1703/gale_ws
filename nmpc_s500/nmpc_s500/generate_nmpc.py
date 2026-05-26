@@ -124,19 +124,24 @@ class QuadrotorEulerErrMPC:
         ocp.cost.cost_type = 'NONLINEAR_LS'
         ocp.cost.cost_type_e = 'NONLINEAR_LS'
 
-        # Cost weights (same as original, but now applied to errors)
-        ref_cost = 1e3
-        vel_cost = 1e1
+        # Axis-specific weights let us damp XY hover oscillation without
+        # disturbing the vertical hover calibration.
+        pos_xy_cost = 5e3
+        pos_z_cost = 5e2
+        vel_xy_cost = 5e1
+        vel_z_cost = 2e1
         ang_cost = 1e1
-        Q_mat = 2 * np.diag([ref_cost, ref_cost, ref_cost,  # position error
-                            vel_cost, vel_cost, vel_cost,   # velocity error
-                            ang_cost, ang_cost, 1e2])       # euler error (yaw weighted higher)
+        Q_mat = 2 * np.diag([pos_xy_cost, pos_xy_cost, pos_z_cost,
+                             vel_xy_cost, vel_xy_cost, vel_z_cost,
+                             ang_cost, ang_cost, 1e2])       # euler error (yaw weighted higher)
 
-        ref_cost_e = 1e3
-        vel_cost_e = 1e1
+        pos_xy_cost_e = 5e3
+        pos_z_cost_e = 5e2
+        vel_xy_cost_e = 5e1
+        vel_z_cost_e = 2e1
         ang_cost_e = 1e1
-        Q_e = np.diag([ref_cost_e, ref_cost_e, ref_cost_e,
-                       vel_cost_e, vel_cost_e, vel_cost_e,
+        Q_e = np.diag([pos_xy_cost_e, pos_xy_cost_e, pos_z_cost_e,
+                       vel_xy_cost_e, vel_xy_cost_e, vel_z_cost_e,
                        ang_cost_e, ang_cost_e, 1e2])
 
         R_mat = np.diag([1e1, 1e3, 1e3, 1e2])  # thrust, p, q, r rates

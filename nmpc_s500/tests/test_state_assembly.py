@@ -168,6 +168,63 @@ class TestStateAssembly(unittest.TestCase):
 
         np.testing.assert_allclose(node.hover_yaw_ned, np.pi / 2, atol=1e-9)
 
+    def test_circle_reference_holds_hover_yaw_before_circle_starts(self):
+        node = NmpcNode.__new__(NmpcNode)
+        node.circle_center_ned = np.array([0.0, 0.0, -2.0])
+        node.circle_radius_m = 3.0
+        node.circle_period_sec = 30.0
+        node.circle_hover_sec = 5.0
+        node.circle_ramp_sec = 0.0
+        node.circle_direction = 1.0
+        node.hover_yaw_ned = np.pi / 2
+
+        ref = node._circle_reference_at(elapsed=2.0)
+
+        np.testing.assert_allclose(ref[6:9], [0.0, 0.0, np.pi / 2], atol=1e-9)
+
+    def test_circle_reference_rotates_yaw_tangent_to_circle(self):
+        node = NmpcNode.__new__(NmpcNode)
+        node.circle_center_ned = np.array([0.0, 0.0, -2.0])
+        node.circle_radius_m = 3.0
+        node.circle_period_sec = 30.0
+        node.circle_hover_sec = 5.0
+        node.circle_ramp_sec = 0.0
+        node.circle_direction = 1.0
+        node.hover_yaw_ned = np.pi / 2
+
+        ref = node._circle_reference_at(elapsed=12.5)
+
+        np.testing.assert_allclose(ref[6:9], [0.0, 0.0, -np.pi / 2], atol=1e-9)
+
+    def test_shutdown_land_setpoint_targets_configured_enu_position(self):
+        node = NmpcNode.__new__(NmpcNode)
+        node.shutdown_land_position_enu = np.array([0.0, 0.0, 0.0])
+        node.pose = _pose_msg(1.0, 2.0, 3.0, qx=0.1, qy=0.2, qz=0.3, qw=0.9)
+
+        with patch("nmpc_s500.nmpc_node.rospy.Time.now", return_value=0.0):
+            msg = node._build_shutdown_land_setpoint()
+
+        self.assertEqual(msg.pose.position.x, 0.0)
+        self.assertEqual(msg.pose.position.y, 0.0)
+        self.assertEqual(msg.pose.position.z, 0.0)
+        self.assertEqual(msg.pose.orientation.x, 0.1)
+        self.assertEqual(msg.pose.orientation.y, 0.2)
+        self.assertEqual(msg.pose.orientation.z, 0.3)
+        self.assertEqual(msg.pose.orientation.w, 0.9)
+
+    def test_shutdown_setpoint_can_command_yaw_zero(self):
+        node = NmpcNode.__new__(NmpcNode)
+        node.pose = _pose_msg(1.0, 2.0, 3.0, qx=0.1, qy=0.2, qz=0.3, qw=0.9)
+
+        with patch("nmpc_s500.nmpc_node.rospy.Time.now", return_value=0.0):
+            msg = node._build_shutdown_land_setpoint(np.array([0.0, 0.0, 1.0]), yaw_enu=0.0)
+
+        self.assertEqual(msg.pose.position.z, 1.0)
+        self.assertEqual(msg.pose.orientation.x, 0.0)
+        self.assertEqual(msg.pose.orientation.y, 0.0)
+        self.assertEqual(msg.pose.orientation.z, 0.0)
+        self.assertEqual(msg.pose.orientation.w, 1.0)
+
     def test_publish_attitude_target_converts_solver_frd_rates_to_mavros_flu(self):
         node = self._make_node()
         solver_u = np.array([node.platform_cfg.mass_kg * 9.81, 0.0, 0.5, 0.0])

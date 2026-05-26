@@ -11,5 +11,12 @@
     <param name="hover_yaw" value="0.0" />
     <param name="control_rate_hz" value="50" />
     <param name="enable_offboard_on_start" value="false" />
+    <param name="shutdown_land_on_ctrl_c" value="true" />
+    <rosparam param="shutdown_approach_position">[0.0, 0.0, 1.0]</rosparam>
+    <param name="shutdown_yaw" value="0.0" />
+    <param name="shutdown_approach_duration_sec" value="8.0" />
+    <param name="shutdown_approach_timeout_sec" value="20.0" />
+    <rosparam param="shutdown_land_position">[0.0, 0.0, 0.0]</rosparam>
+    <param name="shutdown_land_timeout_sec" value="20.0" />
   </node>
 </launch>

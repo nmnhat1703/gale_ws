@@ -1,3 +1,35 @@
-Need to config the config.yaml file to correct lidar model "lidar_type: RSAIRY", also change the ip address of jetson correct with the default address of robosense which is 192.168.1.102 (also check the host_address: 192.168.1.102 in the config.yaml)
+rostopic echo /rosout | rg "RUN diag|vel_ned_mps|rpy_ned_deg|u_frd|rates_flu_degps"
 
-Change set(POINT_TYPE XYZIRT) in the CMakelist file of package to get the data with time ring
+  Or, to see each full wrapped diagnostic message more cleanly:
+
+  rostopic echo /rosout | rg -A1 "RUN diag"
+
+
+  For a first hover-oscillation tuning pass, try:
+
+  ref_cost = 1e2      # was 1e3
+  vel_cost = 1e2      # was 1e1
+  ang_cost = 1e1
+
+  ref_cost_e = 1e2    # was 1e3
+  vel_cost_e = 1e2    # was 1e1
+  ang_cost_e = 1e1
+
+  That makes the controller less aggressive about instantly killing position error, and
+  more aggressive about damping velocity. In practice, that usually reduces hover
+  hunting.
+
+  Then regenerate the acados solver, because these weights are baked into the generated
+  solver:
+
+  cd ~/gale_ws
+  source devel/setup.bash
+  python3 src/nmpc_s500/scripts/generate_solver.py --platform sim_iris
+
+  For hardware tuning, use:
+
+  python3 src/nmpc_s500/scripts/generate_solver.py --platform real_s500
+
+  Then restart the NMPC launch:
+
+  roslaunch nmpc_s500 sitl_iris.launch

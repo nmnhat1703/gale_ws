@@ -30,6 +30,7 @@ from nmpc_s500.frames import (
     enu_yaw_to_ned_yaw,
     flu_to_frd_quaternion,
     quaternion_to_euler_zyx,
+    wrap_to_pi,
 )
 
 
@@ -101,6 +102,29 @@ class NmpcNode:
         hover_yaw_enu = rospy.get_param('~hover_yaw', 0.0)
         self.hover_yaw_ned = enu_yaw_to_ned_yaw(hover_yaw_enu)
         self.enable_offboard_on_start = rospy.get_param('~enable_offboard_on_start', False)
+        circle_center_param = rospy.get_param('~circle_center', [0.0, 0.0, 2.0])
+        circle_center_enu = np.array(circle_center_param, dtype=float)
+        self.circle_center_ned = np.array(
+            enu_to_ned_position(circle_center_enu[0], circle_center_enu[1], circle_center_enu[2]),
+            dtype=float,
+        )
+        self.circle_radius_m = float(rospy.get_param('~circle_radius_m', 3.0))
+        self.circle_period_sec = float(rospy.get_param('~circle_period_sec', 30.0))
+        self.circle_hover_sec = float(rospy.get_param('~circle_hover_sec', 5.0))
+        self.circle_ramp_sec = float(rospy.get_param('~circle_ramp_sec', 8.0))
+        self.circle_direction = float(rospy.get_param('~circle_direction', 1.0))
+        shutdown_approach_param = rospy.get_param('~shutdown_approach_position', [0.0, 0.0, 1.0])
+        self.shutdown_approach_position_enu = np.array(shutdown_approach_param, dtype=float)
+        shutdown_land_param = rospy.get_param('~shutdown_land_position', [0.0, 0.0, 0.0])
+        self.shutdown_land_position_enu = np.array(shutdown_land_param, dtype=float)
+        self.shutdown_yaw_enu = float(rospy.get_param('~shutdown_yaw', 0.0))
+        self.shutdown_land_on_ctrl_c = bool(rospy.get_param('~shutdown_land_on_ctrl_c', True))
+        self.shutdown_approach_duration_sec = float(rospy.get_param('~shutdown_approach_duration_sec', 8.0))
+        self.shutdown_approach_timeout_sec = float(rospy.get_param('~shutdown_approach_timeout_sec', 20.0))
+        self.shutdown_land_timeout_sec = float(rospy.get_param('~shutdown_land_timeout_sec', 20.0))
+        self.shutdown_land_rate_hz = float(rospy.get_param('~shutdown_land_rate_hz', 20.0))
+        self.shutdown_land_tolerance_m = float(rospy.get_param('~shutdown_land_tolerance_m', 0.20))
+        self.shutdown_land_hold_sec = float(rospy.get_param('~shutdown_land_hold_sec', 1.0))
         # Diagnostic logging period in seconds. Default 1.0 (1 Hz human-readable).
         # Drop to ~0.2 for SITL tuning to get 5 Hz time-series.
         self.diag_log_period_sec = rospy.get_param('~diag_log_period_sec', 1.0)
@@ -117,6 +141,20 @@ class NmpcNode:
         )
         rospy.loginfo(f"[NMPC] Diagnostic log period: {self.diag_log_period_sec:.2f} s")
         rospy.loginfo(f"[NMPC] Enable OFFBOARD on start: {self.enable_offboard_on_start}")
+        rospy.loginfo(
+            f"[NMPC] Shutdown land: enabled={self.shutdown_land_on_ctrl_c}, "
+            f"approach ENU={self.shutdown_approach_position_enu}, "
+            f"yaw ENU={self.shutdown_yaw_enu:+.3f} rad, "
+            f"land ENU={self.shutdown_land_position_enu}, "
+            f"tolerance={self.shutdown_land_tolerance_m:.2f} m"
+        )
+        if self.trajectory_type == 'circle':
+            rospy.loginfo(
+                f"[NMPC] Circle trajectory: center ENU={circle_center_enu}, "
+                f"center NED={self.circle_center_ned}, radius={self.circle_radius_m:.2f} m, "
+                f"period={self.circle_period_sec:.1f} s, hover={self.circle_hover_sec:.1f} s, "
+                f"ramp={self.circle_ramp_sec:.1f} s"
+            )
 
         # ===== Load Platform Config =====
         try:
@@ -165,6 +203,7 @@ class NmpcNode:
         # Timing for state machine
         self.phase_enter_time = time.time()
         self.setpoint_stream_start_time = None
+        self.run_start_time = None
 
         # Running statistics
         self.solver_times = deque(maxlen=100)
@@ -174,6 +213,11 @@ class NmpcNode:
         self.attitude_pub = rospy.Publisher(
             '/mavros/setpoint_raw/attitude',
             AttitudeTarget,
+            queue_size=1
+        )
+        self.position_pub = rospy.Publisher(
+            '/mavros/setpoint_position/local',
+            PoseStamped,
             queue_size=1
         )
 
@@ -270,6 +314,71 @@ class NmpcNode:
         # Build state vector
         x = np.hstack((p, v, euler))
         return x
+
+    @staticmethod
+    def _smoothstep(s):
+        """Cubic smoothstep and derivative for s in [0, 1]."""
+        s_clamped = np.clip(s, 0.0, 1.0)
+        value = s_clamped * s_clamped * (3.0 - 2.0 * s_clamped)
+        deriv = 6.0 * s_clamped * (1.0 - s_clamped)
+        return value, deriv
+
+    def _circle_reference_at(self, elapsed):
+        """Return one 9D circle reference in solver/NED frame."""
+        if elapsed < self.circle_hover_sec:
+            pos_ned = self.circle_center_ned
+            vel_ned = np.zeros(3)
+            yaw_ned = self.hover_yaw_ned
+        else:
+            t_circle = elapsed - self.circle_hover_sec
+            omega = self.circle_direction * 2.0 * np.pi / self.circle_period_sec
+            theta = omega * t_circle
+
+            if self.circle_ramp_sec > 0.0 and t_circle < self.circle_ramp_sec:
+                ramp, ramp_deriv = self._smoothstep(t_circle / self.circle_ramp_sec)
+                radius = self.circle_radius_m * ramp
+                radius_dot = self.circle_radius_m * ramp_deriv / self.circle_ramp_sec
+            else:
+                radius = self.circle_radius_m
+                radius_dot = 0.0
+
+            center_enu = np.array([
+                self.circle_center_ned[1],
+                self.circle_center_ned[0],
+                -self.circle_center_ned[2],
+            ])
+            radial_enu = np.array([np.cos(theta), np.sin(theta), 0.0])
+            tangent_enu = np.array([-np.sin(theta), np.cos(theta), 0.0])
+            pos_enu = center_enu + radius * radial_enu
+            vel_enu = radius_dot * radial_enu + radius * omega * tangent_enu
+
+            pos_ned = np.array(enu_to_ned_position(pos_enu[0], pos_enu[1], pos_enu[2]))
+            vel_ned = np.array(enu_to_ned_velocity(vel_enu[0], vel_enu[1], vel_enu[2]))
+            yaw_ned = wrap_to_pi(self.hover_yaw_ned - theta - self.circle_direction * np.pi / 2.0)
+
+        return np.hstack((
+            pos_ned,
+            vel_ned,
+            [0.0, 0.0, yaw_ned],
+        ))
+
+    def _build_reference_trajectory(self, start_elapsed=None):
+        """Build the NMPC reference trajectory for the full prediction horizon."""
+        if self.trajectory_type == 'circle':
+            if start_elapsed is None:
+                start_elapsed = 0.0
+            dt = DEFAULT_HORIZON / DEFAULT_NUM_STEPS
+            return np.vstack([
+                self._circle_reference_at(start_elapsed + i * dt)
+                for i in range(DEFAULT_NUM_STEPS)
+            ])
+
+        ref_per_stage = np.hstack((
+            self.hover_position_ned,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, self.hover_yaw_ned],
+        ))
+        return np.tile(ref_per_stage, (DEFAULT_NUM_STEPS, 1))
 
     def _solve(self, x_now, x_ref):
         """Solve NMPC problem.
@@ -420,12 +529,7 @@ class NmpcNode:
             x_hover = self._build_state_vector()
             # Build 9D reference [p, v, euler]. u_ref is built internally
             # by solve_mpc_control from quad.m * quad.g (see generate_nmpc.py).
-            ref_per_stage = np.hstack((
-                self.hover_position_ned,                # 3: position (NED)
-                [0.0, 0.0, 0.0],                        # 3: velocity
-                [0.0, 0.0, self.hover_yaw_ned],         # 3: euler (yaw only, NED)
-            ))                                          # = 9D
-            x_ref = np.tile(ref_per_stage, (DEFAULT_NUM_STEPS, 1))
+            x_ref = self._build_reference_trajectory(start_elapsed=0.0)
 
             for i in range(SOLVER_WARMUP_ITERATIONS):
                 _, _, _ = self._solve(x_hover, x_ref)
@@ -552,14 +656,13 @@ class NmpcNode:
             self._publish_safe_hover()
             return FlightPhase.RUN
 
+        if self.run_start_time is None:
+            self.run_start_time = time.time()
+        run_elapsed = time.time() - self.run_start_time
+
         # Build 9D reference [p, v, euler]. u_ref is built internally
         # by solve_mpc_control from quad.m * quad.g (see generate_nmpc.py).
-        ref_per_stage = np.hstack((
-            self.hover_position_ned,                # 3: position (NED)
-            [0.0, 0.0, 0.0],                        # 3: velocity
-            [0.0, 0.0, self.hover_yaw_ned],         # 3: euler (yaw only, NED)
-        ))                                          # = 9D
-        x_ref = np.tile(ref_per_stage, (DEFAULT_NUM_STEPS, 1))
+        x_ref = self._build_reference_trajectory(start_elapsed=run_elapsed)
 
         u_optimal, solve_time, status = self._solve(x_now, x_ref)
 
@@ -605,6 +708,7 @@ class NmpcNode:
             f"failures={self.consecutive_solver_failures} "
             f"solve_ms={solve_time * 1000.0:.1f} "
             f"pos_ned_m=[{x_now[0]:+.2f},{x_now[1]:+.2f},{x_now[2]:+.2f}] "
+            f"ref_ned_m=[{x_ref[0, 0]:+.2f},{x_ref[0, 1]:+.2f},{x_ref[0, 2]:+.2f}] "
             f"vel_ned_mps=[{x_now[3]:+.2f},{x_now[4]:+.2f},{x_now[5]:+.2f}] "
             f"rpy_ned_deg=[{np.degrees(x_now[6]):+.1f},"
             f"{np.degrees(x_now[7]):+.1f},{np.degrees(x_now[8]):+.1f}] "
@@ -647,13 +751,189 @@ class NmpcNode:
             rospy.logerr(f"[NMPC] Control loop exception: {e}")
             self._publish_safe_hover()
 
+    @staticmethod
+    def _enu_yaw_to_quaternion(yaw_enu):
+        """Return a FLU/ENU quaternion for a world-Z yaw setpoint."""
+        half_yaw = 0.5 * yaw_enu
+        return 0.0, 0.0, float(np.sin(half_yaw)), float(np.cos(half_yaw))
+
+    @staticmethod
+    def _quaternion_to_enu_yaw(q):
+        """Extract ENU yaw from a ROS quaternion."""
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return float(np.arctan2(siny_cosp, cosy_cosp))
+
+    def _build_shutdown_land_setpoint(self, position_enu=None, yaw_enu=None):
+        """Build a MAVROS local ENU position setpoint for shutdown landing."""
+        if position_enu is None:
+            position_enu = self.shutdown_land_position_enu
+
+        msg = PoseStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.pose.position.x = float(position_enu[0])
+        msg.pose.position.y = float(position_enu[1])
+        msg.pose.position.z = float(position_enu[2])
+
+        if yaw_enu is None and self.pose is not None:
+            msg.pose.orientation = self.pose.pose.orientation
+        else:
+            qx, qy, qz, qw = self._enu_yaw_to_quaternion(0.0 if yaw_enu is None else yaw_enu)
+            msg.pose.orientation.x = qx
+            msg.pose.orientation.y = qy
+            msg.pose.orientation.z = qz
+            msg.pose.orientation.w = qw
+
+        return msg
+
+    def _shutdown_land_position_error(self, target_enu):
+        """Return current ENU distance to a shutdown target, or None."""
+        if self.pose is None:
+            return None
+
+        dx = self.pose.pose.position.x - target_enu[0]
+        dy = self.pose.pose.position.y - target_enu[1]
+        dz = self.pose.pose.position.z - target_enu[2]
+        return float(np.sqrt(dx * dx + dy * dy + dz * dz))
+
+    def _publish_shutdown_position_until_reached(self, target_enu, yaw_enu, timeout_sec, label):
+        """Publish one shutdown position target until it is held or times out."""
+        rospy.loginfo(
+            f"[NMPC] Shutdown {label}: target ENU "
+            f"[{target_enu[0]:+.2f},{target_enu[1]:+.2f},{target_enu[2]:+.2f}], "
+            f"yaw={'current' if yaw_enu is None else f'{yaw_enu:+.3f} rad'}"
+        )
+
+        target = self._build_shutdown_land_setpoint(target_enu, yaw_enu=yaw_enu)
+        period = 1.0 / max(self.shutdown_land_rate_hz, 1.0)
+        deadline = time.time() + timeout_sec
+        reached_since = None
+        last_offboard_request = 0.0
+
+        while time.time() < deadline:
+            target.header.stamp = rospy.Time.now()
+            self.position_pub.publish(target)
+
+            now = time.time()
+            if now - last_offboard_request > 1.0:
+                try:
+                    self.set_mode_service(custom_mode="OFFBOARD")
+                except Exception as e:
+                    rospy.logwarn(f"[NMPC] Failed to keep OFFBOARD during shutdown {label}: {e}")
+                last_offboard_request = now
+
+            err = self._shutdown_land_position_error(target_enu)
+            if err is not None:
+                rospy.loginfo_throttle(
+                    1.0,
+                    f"[NMPC] Shutdown {label} error: {err:.2f} m"
+                )
+                if err <= self.shutdown_land_tolerance_m:
+                    if reached_since is None:
+                        reached_since = now
+                    elif now - reached_since >= self.shutdown_land_hold_sec:
+                        rospy.loginfo(f"[NMPC] Shutdown {label} target reached")
+                        return True
+                else:
+                    reached_since = None
+
+            time.sleep(period)
+
+        rospy.logwarn(f"[NMPC] Shutdown {label} timed out")
+        return False
+
+    def _publish_shutdown_interpolated_approach(self):
+        """Smoothly move from the current pose to the approach pose and yaw."""
+        if self.pose is None:
+            return False
+
+        start_position = np.array([
+            self.pose.pose.position.x,
+            self.pose.pose.position.y,
+            self.pose.pose.position.z,
+        ], dtype=float)
+        start_yaw = self._quaternion_to_enu_yaw(self.pose.pose.orientation)
+        yaw_delta = wrap_to_pi(self.shutdown_yaw_enu - start_yaw)
+        period = 1.0 / max(self.shutdown_land_rate_hz, 1.0)
+        duration = max(self.shutdown_approach_duration_sec, period)
+        steps = max(1, int(duration * self.shutdown_land_rate_hz))
+        last_offboard_request = 0.0
+
+        rospy.loginfo(
+            f"[NMPC] Shutdown approach ramp: ENU "
+            f"[{start_position[0]:+.2f},{start_position[1]:+.2f},{start_position[2]:+.2f}] -> "
+            f"[{self.shutdown_approach_position_enu[0]:+.2f},"
+            f"{self.shutdown_approach_position_enu[1]:+.2f},"
+            f"{self.shutdown_approach_position_enu[2]:+.2f}] "
+            f"and yaw {start_yaw:+.3f} -> {self.shutdown_yaw_enu:+.3f} rad"
+        )
+
+        for i in range(steps + 1):
+            s = float(i) / float(steps)
+            ramp, _ = self._smoothstep(s)
+            position = start_position + ramp * (self.shutdown_approach_position_enu - start_position)
+            yaw = wrap_to_pi(start_yaw + ramp * yaw_delta)
+            target = self._build_shutdown_land_setpoint(position, yaw_enu=yaw)
+            self.position_pub.publish(target)
+
+            now = time.time()
+            if now - last_offboard_request > 1.0:
+                try:
+                    self.set_mode_service(custom_mode="OFFBOARD")
+                except Exception as e:
+                    rospy.logwarn(f"[NMPC] Failed to keep OFFBOARD during shutdown approach ramp: {e}")
+                last_offboard_request = now
+
+            time.sleep(period)
+
+        return True
+
+    def _land_to_shutdown_position(self):
+        """Best-effort Ctrl-C landing by publishing local position setpoints."""
+        if not self.shutdown_land_on_ctrl_c:
+            return False
+
+        if self.pose is None:
+            rospy.logwarn("[NMPC] Shutdown landing skipped: no local pose available")
+            return False
+
+        if self.mavros_state is not None and not self.mavros_state.connected:
+            rospy.logwarn("[NMPC] Shutdown landing skipped: FCU is not connected")
+            return False
+
+        reached_approach = self._publish_shutdown_interpolated_approach()
+        if not reached_approach:
+            return False
+
+        return self._publish_shutdown_position_until_reached(
+            self.shutdown_land_position_enu,
+            yaw_enu=self.shutdown_yaw_enu,
+            timeout_sec=self.shutdown_land_timeout_sec,
+            label="landing",
+        )
+
     def _on_shutdown(self):
-        """Shutdown handler: gracefully transition to POSCTL and stop publishing."""
+        """Shutdown handler: land to the configured origin, then leave OFFBOARD."""
         rospy.loginfo("[NMPC] Shutdown signal received")
+        try:
+            self.control_timer.shutdown()
+        except Exception as e:
+            rospy.logwarn(f"[NMPC] Failed to stop control timer on shutdown: {e}")
+
+        landed = False
+        try:
+            landed = self._land_to_shutdown_position()
+        except Exception as e:
+            rospy.logwarn(f"[NMPC] Shutdown landing failed: {e}")
+
         try:
             self.set_mode_service(custom_mode="POSCTL")
         except Exception as e:
             rospy.logwarn(f"[NMPC] Failed to set POSCTL on shutdown: {e}")
+
+        if landed:
+            rospy.loginfo("[NMPC] Shutdown complete after landing target reached")
 
 
 def main():
