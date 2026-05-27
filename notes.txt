@@ -290,7 +290,7 @@ python3 -m pip install -e /home/nhat/acados/interfaces/acados_template
 
 mkdir -p $ACADOS_SOURCE_DIR/bin
 
-~/acados/bin
+cd ~/acados/bin
 
 python3 - <<'PY'
 from acados_template import get_tera
@@ -305,6 +305,18 @@ python3 minimal_example_ocp.py
 
 ------------------------------------------------------------------
 2) Install PX4-Autopilot
+
+sudo apt update
+sudo apt install -y \
+    ros-noetic-mavros \
+    ros-noetic-mavros-extras \
+    ros-noetic-mavros-msgs
+
+cd ~
+wget -O install_geographiclib_datasets.sh \
+    https://raw.githubusercontent.com/mavlink/mavros/master/mavros/scripts/install_geographiclib_datasets.sh
+
+sudo bash ./install_geographiclib_datasets.sh
 
 cd ~
 
