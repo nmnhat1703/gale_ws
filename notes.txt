@@ -283,7 +283,7 @@ cmake -DACADOS_WITH_QPOASES=ON ..
 make install -j4
 
 echo 'export ACADOS_SOURCE_DIR=/home/nhat/acados' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib' >> ~/.bashrc
+echo 'LD_LIBRARY_PATH=/home/nhat/acados/lib:${LD_LIBRARY_PATH}' >> ~/.bashrc
 source ~/.bashrc
 
 python3 -m pip install -e /home/nhat/acados/interfaces/acados_template
