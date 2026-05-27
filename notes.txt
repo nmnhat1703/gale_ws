@@ -33,3 +33,327 @@ rostopic echo /rosout | rg "RUN diag|vel_ned_mps|rpy_ned_deg|u_frd|rates_flu_deg
   Then restart the NMPC launch:
 
   roslaunch nmpc_s500 sitl_iris.launch
+
+
+
+Detailed plan: LiDAR-Observability-Aware NMPC for Confined-Space Slow Flight
+Phase 0 — Foundations and decisions you need to commit to first
+Before writing any code, lock these down. Each shapes everything that follows.
+0.1 Hardware confirmation
+I need explicit answers from you, or I'm guessing.
+    • Companion computer model and OS? Jetson Orin Nano? Pi 4? NUC? acados solve time depends on this. ROS 1 Noetic on Ubuntu 20.04 I assume from CLAUDE.md, but the companion may be different from the dev machine. 
+    • Companion ↔ Pixhawk physical link? USB? TELEM2 UART? Which baud rate? 
+    • Is the LiDAR point cloud accessible on the companion? What ROS topic, what frame, what rate? Hesai JT128 ROS driver publishes at 10 Hz typically. Confirm the topic name and message type (sensor_msgs/PointCloud2 I assume). 
+    • FAST-LIO2 currently runs on which machine? If it's on the companion, that's fine. If it's somewhere else, the new NMPC node needs to be co-located with FAST-LIO output or we add network latency. 
+0.2 Architecture commitment — which OFFBOARD sub-mode
+Three options, pick one and stick with it:
+A. Position-mode setpoint (setpoint_position/local) — easiest. NMPC outputs the next position waypoint. PX4 does everything else. Loses some of the point of NMPC because PX4 re-smooths your setpoint. Use this if you want to ship fast.
+B. Attitude setpoint (setpoint_raw/local with type_mask for attitude) — medium. NMPC outputs quaternion + collective thrust at 50–100 Hz. PX4 attitude+rate loop tracks it. This is what the published acados+PX4 NMPC packages use. Default recommendation.
+C. Body rate setpoint — hardest. NMPC outputs body rates + thrust. Only PX4 rate loop is in play. Better tracking but more work.
+I'd commit to B (attitude setpoint) unless there's a reason otherwise. It's the standard for published NMPC+PX4 work, and the reference implementation (evannsmc/nmpc_acados_px4) uses it.
+0.3 NMPC software stack
+    • Solver: acados. It's the standard. casadi is the modelling layer, acados is the codegen + RTI solver. Both come together. 
+    • Language for NMPC node: C++ for production-style, Python for fast iteration. I'd recommend Python for the prototype, port to C++ only if solve time is borderline. acados has good Python bindings and the solver itself is C anyway. 
+    • ROS: ROS 1 Noetic per CLAUDE.md. 
+0.4 What "observability" actually means here
+This is the conceptual heart of the contribution and it's where most of your novelty work happens. There are at least three things you could mean:
+(i) Local-point-cloud spectral spread: take the current LiDAR scan, compute the 3×3 covariance matrix of point positions in the robot frame, look at eigenvalues. Small eigenvalue in some direction = few points spread in that direction = future motion in that direction will be poorly constrained by scan matching. This is what I'd start with. It's computed once per scan, cheap, well-defined.
+(ii) Registration information matrix: from FAST-LIO's iEKF, the actual information matrix of the LiDAR factor. This is the right thing mathematically but requires modifying FAST-LIO to expose it. More work, more correct.
+(iii) Predicted observability at future poses: this is what perception-aware NMPC needs in its cost — not "observability now" but "observability if I move to position $x_k$ in $k$ steps." You build a local observability field and look it up at each NMPC stage.
+My recommendation: start with (i) as the field source — i.e., use the current scan to estimate a local observability field over a coarse voxel grid around the robot, and look up that field over the NMPC horizon. If reviewers push back on rigor, you have a path to (ii). Don't promise (ii) in the abstract.
+
+
+0.5 Test environment
+What can you build? The whole paper depends on having a physically observable degenerate scenario. Options:
+    • Cardboard corridor: two parallel cardboard or foam-board walls, ~4 m long, ~1 m wide. Cheap, easy, probably enough. 
+    • Lab space with existing walls: walk around your lab, find a section where two parallel walls dominate the LiDAR FOV for several meters. 
+    • Outdoor between-buildings passage: works if you have indoor flight clearance somewhere else; outdoor LIO is fine in a passage. 
+I'd build the cardboard corridor — it gives a controlled, reproducible degenerate environment, and you can compare "in corridor" vs "in open" without rearranging the whole lab. Decide this before you start coding because it sets your test trajectories.
+
+Phase 1 — Get the NMPC baseline running (no observability yet)
+Goal: a working NMPC node on the companion that flies the drone via OFFBOARD attitude setpoints, with quality at least matching your current position-mode OFFBOARD baseline (flight 29).
+1.1 Pull the reference implementation
+The starting point is evannsmc/nmpc_acados_px4 — published with ACC 2024 paper, ROS 2 + acados + PX4. You'll port to ROS 1.
+Read the repo top-to-bottom before touching anything. Specifically understand:
+    • How they formulate the cost (NONLINEAR_LS, error-state) 
+    • Their input constraints (thrust [0, 27] N, body rates [−0.8, 0.8] rad/s — you'll need to set yours from your S500 measurements) 
+    • How they generate the acados solver via Python template, then build it 
+    • How they call the solver from the ROS node (warm-starting, RTI) 
+    • How they map NMPC output (quaternion + thrust) to PX4 setpoint topics 
+1.2 Port ROS 2 → ROS 1
+Two layers to change:
+    • Replace rclpy/rclcpp with rospy/roscpp 
+    • Replace px4_msgs (PX4 native uORB-bridge messages used in ROS 2) with mavros_msgs topics 
+The acados solver code itself is C and unchanged.
+Key topic mapping:
+Function
+ROS 2 (PX4)
+ROS 1 (mavros)
+Current pose
+/fmu/out/vehicle_local_position
+/mavros/local_position/pose
+Current velocity
+(in same msg)
+/mavros/local_position/velocity_local
+Attitude setpoint
+/fmu/in/vehicle_attitude_setpoint
+/mavros/setpoint_raw/attitude
+OFFBOARD enable
+/fmu/in/offboard_control_mode
+mavros set_mode service
+1.3 System identification for the NMPC model
+The NMPC needs an inertia matrix, mass, and thrust constants for your S500.
+    • Mass: measure. Include the LiDAR, battery, all mounted gear. Probably 1.4–1.8 kg. 
+    • Hover thrust: you already know from flight 29 — HTE = 0.196 normalized. From that you can back out actual hover thrust in Newtons: $T_{hover} = m \cdot g$, normalized thrust 0.196 maps to that. Solve for max thrust per motor. 
+    • Moment of inertia: hardest. Three options ranked by accuracy: 
+        1. CAD model with motor/battery/LiDAR masses — quick, accurate to ~20% 
+        2. Bifilar pendulum experiment — accurate to ~5%, takes a day 
+        3. System ID from flight data — accurate but requires excitation flights 
+      Start with (1) for the prototype. Refine with (3) if NMPC tracking is poor. 
+    • Thrust constant $k_T$ (motor command → thrust): with HTE = 0.196 and hover thrust known, this falls out. Document the assumption that thrust is quadratic in motor command (standard, true for small drones). 
+Record all these in CLAUDE.md as you go. Future-you will need them.
+1.4 First simulation flight
+Before flying, run NMPC in PX4 SITL + Gazebo. Same parameters as your real S500. Track a simple trajectory: hover, then 1 m step in Y, then return. Verify:
+    • Solver converges (no SQP failures, solve time < 20 ms) 
+    • Tracking error reasonable (RMS < 10 cm on the position step) 
+    • Attitude setpoints are sane (no commanded 45° dives or anything weird) 
+    • No oscillation when the drone is at the setpoint 
+If any of these fail, fix in sim before flying real. Don't proceed otherwise.
+1.5 First real flight
+When SITL is clean, fly the same trajectory on the real drone. Match your existing flight 29 protocol:
+    • STAB takeoff, manual ascent 
+    • Switch to OFFBOARD (NMPC will start commanding) 
+    • Same hover height (~1 m), same Y excursion 
+    • RC kill switch available 
+    • Full SDLOG_PROFILE = 2047 
+Compare against flight 29: position tracking RMS, EKF innovations, motor commands, vibration. The NMPC baseline should be roughly equivalent or better.
+Stop and document. This is your "NMPC baseline" — the comparison point for the rest of the paper.
+
+Phase 2 — Build the observability monitor
+Separate from NMPC. This is a standalone ROS node that subscribes to the LiDAR point cloud and publishes an observability field.
+2.1 Define the observability metric precisely
+Pick one definition and commit. I'd start with:
+For a LiDAR scan with $N$ points ${p_i}$ in robot body frame, the directional observability in direction $\hat{d}$ is:
+$$o(\hat{d}) = \frac{1}{N} \sum_i w_i \cdot |\hat{n}_i \cdot \hat{d}|$$
+where $\hat{n}_i$ is the surface normal at point $p_i$ and $w_i$ is a weight (range-dependent or constant). Intuitively: directions in which many surfaces have aligned normals are well-constrained for ICP/scan-matching; directions perpendicular to all visible surfaces are degenerate.
+This is the standard scan-matching observability from the Zhang & Singh 2016 paper ("On Degeneracy of Optimization-based State Estimators"), well-cited.
+For an even simpler first pass: compute the 3×3 covariance matrix of the point positions, take its eigendecomposition, and use the smallest eigenvalue as a scalar degeneracy score. This is cruder but takes 10 lines of code and is enough to validate the pipeline.
+Start with the eigenvalue version. Upgrade to the normal-based version if and only if the simpler one isn't sensitive enough in your corridor experiment. This is a real DECIDE LATER point.
+2.2 From scalar to field
+The observability of the current scan tells you about the current pose. NMPC needs predicted observability at future poses. Two approaches:
+Approach A (lazy, recommended first): assume observability is approximately constant over the NMPC prediction horizon (typically 1–2 s at 50–100 Hz). Use one scalar value, look it up the same way at every stage of the NMPC. Justification: at 0.5 m/s and a 1 s horizon, the drone moves 0.5 m, and indoor LiDAR observability doesn't change drastically over 0.5 m. This is a defensible simplification.
+Approach B (real perception-aware): maintain a coarse 3D voxel grid over the local environment (say 5×5×3 m at 0.5 m resolution). For each voxel, store an estimate of "what would the observability be if I were standing here?" Update from LiDAR scans as you fly. NMPC looks up the voxel each stage visits. This is much more like the published PAMPC / HPA-MPC formulations.
+Start with A. Switch to B in the paper extension section, or as a v2 if A's results are weak.
+2.3 Implementation notes
+    • Use pcl_ros (already in your dependencies probably) for point cloud handling. 
+    • Downsample the input cloud heavily before eigen-decomposition. Hesai JT128 produces ~150k points/scan; you want ~5k for stable PCA. Voxel grid filter at 0.1 m resolution. 
+    • Compute normals only if you go beyond Approach A — they're expensive. 
+    • Publish the observability metric as a std_msgs/Float32 (for Approach A) or as a small voxel grid message (for B). 
+2.4 Sanity test before integration
+Drive the drone around in your test environment (manually, no NMPC). Subscribe to the observability topic. Verify:
+    • Walking through your corridor produces a visibly different observability value vs being in open space 
+    • The transition is smooth, not glitchy 
+    • Values are stable when stationary 
+If you can't see a clear difference in the metric between open and corridor, your metric is wrong and the whole paper has no signal. Fix this before anything else.
+
+Phase 3 — Couple observability into NMPC cost
+Now the actual contribution. Take the working NMPC, add the observability cost, validate it changes behavior.
+3.1 Cost formulation
+Augment the standard NLS cost with a perception term. In acados Python, this means adding a soft cost expression to your model.
+For Approach A (scalar observability):
+$$J = \underbrace{\sum_k |x_k - x_k^{ref}|^2_Q}{\text{tracking}} + \underbrace{\sum_k |u_k|^2_R}{\text{effort}} + \underbrace{w_{obs} \cdot \sum_k \frac{1}{o_{current} + \epsilon} \cdot v_k^T v_k}_{\text{observability}}$$
+The third term: when observability is low ($o$ small), the cost of high velocity ($v^T v$) goes up. NMPC will naturally slow down to reduce velocity-squared cost when perception is weak. When observability is high, the term vanishes and NMPC tracks normally.
+The $\epsilon$ prevents divide-by-zero. $w_{obs}$ is the tuning knob.
+This is the simplest possible observability coupling and it makes a defensible IECON contribution. Don't over-engineer it at first.
+3.2 Implementing in acados
+acados doesn't dynamically change cost weights mid-solve easily. The cleanest way: pass observability as a parameter to the solver. In acados_template, model parameters can be set per-solve and per-stage.
+Workflow each solve cycle:
+    1. Read latest observability scalar 
+    2. solver.set(stage, "p", [observability_value, ...]) for each stage 0..N 
+    3. Solve 
+Cost expression in the model includes p[0] as a multiplier on the velocity penalty.
+3.3 Tuning the weight
+This is sensitive. Strategy:
+    • $w_{obs} = 0$ recovers standard NMPC (your baseline) 
+    • Start with $w_{obs}$ such that, at the worst observed degeneracy, the effective velocity penalty roughly doubles 
+    • Sweep in sim across $w_{obs} \in {0, 0.1, 1, 10}$ on the same trajectory 
+You will get a clear "too small (no effect), about right (slows in corridor), too large (drone refuses to move)" curve. The sweep is itself a paper figure.
+3.4 First test in SITL
+In SITL, you don't have a real LiDAR producing variable observability. Two options:
+    • Mock the observability publisher: a small script that publishes synthetic observability that drops when the simulated drone enters a defined region. This validates the NMPC machinery without depending on the real perception pipeline. 
+    • Run a fake-corridor Gazebo world: harder, but reproduces the full pipeline in sim. 
+Start with the mock publisher. Confirm NMPC behavior changes as expected when observability drops. Then move to real.
+3.5 First real flight with observability cost
+Same trajectory, same test space (your cardboard corridor). Compare:
+    • NMPC baseline (Phase 1) → drone tracks aggressively through corridor, possibly drifts 
+    • NMPC + observability cost → drone slows automatically in corridor 
+Capture full logs. This is your money shot.
+
+Phase 4 — Experiments for the paper
+You need at least three experimental conditions for a real comparison. Suggest:
+Condition
+Description
+What it tests
+B0 Open-space baseline
+NMPC, no obs cost, in open space
+Confirms NMPC works in easy case
+B1 Corridor baseline
+NMPC, no obs cost, through corridor
+The failure mode — drift, overshoot, EKF stress
+P1 Corridor with obs cost
+NMPC + obs cost, through corridor
+The contribution — automatic slowdown, improved stability
+P2 (optional) Open with obs cost
+NMPC + obs cost, in open space
+Confirms no regression in easy case
+A1 (ablation) Direct velocity clamp
+Hard $v_{max}$ reduction in corridor
+Compares your method against the obvious baseline
+A1 is important. A reviewer will say "why not just reduce $v_{max}$ when you see low observability?" Your answer needs to be: "We tried; here are the results; our method does it more gracefully because it's integrated into the optimal trajectory rather than imposed as a hard constraint, so it also reshapes the path." Show that with data.
+4.1 Metrics per condition
+    • Position tracking RMS (commanded vs estimated) 
+    • Maximum lateral excursion in corridor 
+    • EKF innovation RMS (from estimator_aid_src_ev_*) 
+    • EKF rejection count 
+    • Mean velocity through corridor 
+    • Time spent in corridor (should be longer for obs-cost condition — that's the point) 
+    • Solver wall-clock time per iteration 
+4.2 Flight repeats
+For each condition, fly at least 3 repeats. Single-flight results are not publishable. Compute mean and stdev. Reviewers will ask for repeats; provide them upfront.
+4.3 Failure conditions to document honestly
+Things that will go wrong and you should document:
+    • NMPC solve occasionally exceeding deadline → fallback behavior (last valid solution? abort?). Define and document. 
+    • Observability metric briefly glitching → smoothing approach (median over last 5 scans?) 
+    • Corridor exit transient — drone suddenly speeds up. Show this and discuss. 
+Papers that admit limitations get accepted more often than papers that pretend everything works.
+
+Phase 5 — Paper structure
+Don't write the paper last. Sketch the outline at the start of Phase 3 and update as you go. Concretely:
+Section
+Pages
+Content
+Intro
+0.75
+Problem: slow flight in confined LiDAR-degenerate spaces. Gap: perception-aware NMPC for cameras exists; for LiDAR it doesn't. Contribution: observability-aware NMPC for LIO-fused multirotor.
+Related work
+0.75
+PAMPC, HPA-MPC, PA-MPPI (camera-based perception-aware NMPC). LODESTAR, DALI-SLAM (degeneracy-aware LIO). Misyats et al. (PX4-CBF). Position this between them.
+System overview
+0.5
+Hardware: S500, Pixhawk 6X, Hesai JT128, FAST-LIO2. Stack diagram.
+Method
+2.0
+Observability metric definition. NMPC formulation. Cost augmentation. Parameter scheduling.
+Experiments
+1.5
+Setup, trajectories, conditions, metrics. Tables of numbers, time-series plots of one representative flight per condition.
+Discussion
+0.25
+Limitations, future work.
+Refs
+0.25
+
+That's the 6-page version. Two extra paid pages give you room for an ablation study and more plots.
+
+Phase 6 — What I'd want from you to continue
+I've left several "DECIDE LATER" markers. To make progress on the next conversation, I'll need:
+    1. The hardware answers from 0.1 — companion computer, link, FAST-LIO host, LiDAR topic. 
+    2. Decision on Phase 0.2 — committing to attitude-setpoint OFFBOARD. (Default yes unless you object.) 
+    3. Confirmation on 0.5 — can you build/find a corridor-like test environment? If no, the whole plan has to pivot. 
+    4. acados installed on the companion? Or do we need to add that as Phase 0.6? 
+Once I have those I can:
+    • Write the actual acados Python model file with your S500 parameters 
+    • Write the observability monitor ROS node code 
+    • Write the NMPC ROS 1 node skeleton with mavros integration 
+    • Write the experimental flight protocol document 
+What I'd want not to do: write all the code without you having confirmed the architecture. There are too many places where the wrong default choice would cascade into a lot of useless code.
+What's your call on the four open questions?
+
+------------------------------------------------------------------
+1) Install Acados
+Clone and build from source:
+
+git clone https://github.com/acados/acados.git
+cd acados
+git submodule update --recursive --init
+mkdir -p build
+cd build
+cmake -DACADOS_WITH_QPOASES=ON ..
+# add more optional arguments e.g. -DACADOS_WITH_DAQP=ON
+make install -j4
+
+echo 'export ACADOS_SOURCE_DIR=/home/nhat/acados' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ACADOS_SOURCE_DIR/lib' >> ~/.bashrc
+source ~/.bashrc
+
+python3 -m pip install -e /home/nhat/acados/interfaces/acados_template
+
+mkdir -p $ACADOS_SOURCE_DIR/bin
+
+~/acados/bin
+
+python3 - <<'PY'
+from acados_template import get_tera
+get_tera(tera_version='0.0.34', force_download=True)
+PY
+
+chmod +x ~/acados/bin/t_renderer
+
+# test acados
+cd ~/acados/examples/acados_python/getting_started
+python3 minimal_example_ocp.py
+
+------------------------------------------------------------------
+2) Install PX4-Autopilot
+
+cd ~
+
+git clone --branch v1.16.0 --recursive \
+https://github.com/PX4/PX4-Autopilot.git
+
+cd ~/PX4-Autopilot
+git describe --tags --always
+
+Expected output:
+v1.16.0
+
+git submodule sync --recursive
+git submodule update --init --recursive --force
+
+bash ./Tools/setup/ubuntu.sh --no-nuttx
+
+DONT_RUN=1 make px4_sitl_default gazebo-classic_iris
+
+nano ~/PX4-Autopilot/launch/run_px4_sitl.sh
+    #!/bin/bash
+    
+    # Stop if any command fails
+    set -e
+    
+    # PX4 Gazebo Classic paths
+    export PX4_DIR="$HOME/PX4-Autopilot"
+    
+    if [ ! -f "$PX4_DIR/Tools/simulation/gazebo-classic/setup_gazebo.bash" ]; then
+        echo "PX4 Gazebo Classic setup file not found:"
+        echo "$PX4_DIR/Tools/simulation/gazebo-classic/setup_gazebo.bash"
+        exit 1
+    fi
+    
+    if [ ! -d "$PX4_DIR/build/px4_sitl_default" ]; then
+        echo "PX4 SITL build folder not found."
+        echo "Build first with:"
+        echo "cd $PX4_DIR && DONT_RUN=1 make px4_sitl_default gazebo-classic_iris"
+        exit 1
+    fi
+    
+    source "$PX4_DIR/Tools/simulation/gazebo-classic/setup_gazebo.bash" \
+        "$PX4_DIR" "$PX4_DIR/build/px4_sitl_default"
+    
+    export ROS_PACKAGE_PATH="$ROS_PACKAGE_PATH:$PX4_DIR"
+    export ROS_PACKAGE_PATH="$ROS_PACKAGE_PATH:$PX4_DIR/Tools/simulation/gazebo-classic/sitl_gazebo-classic"
+    
+    echo "Launching PX4 SITL + Gazebo Classic + MAVROS..."
+    roslaunch px4 mavros_posix_sitl.launch
+
+chmod +x ~/PX4-Autopilot/launch/run_px4_sitl.sh
+~/PX4-Autopilot/launch/run_px4_sitl.sh
