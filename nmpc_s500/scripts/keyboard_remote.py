@@ -35,9 +35,11 @@ def main():
             choice = input(MENU).strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            rospy.signal_shutdown("keyboard remote interrupted")
             break
 
         if choice == 'q':
+            rospy.signal_shutdown("keyboard remote quit requested")
             break
 
         command = COMMANDS.get(choice)

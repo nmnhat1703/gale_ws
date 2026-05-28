@@ -63,6 +63,13 @@ MIN_RAMP_S = 4.0
 MAX_RAMP_S = 15.0
 RAMP_TARGET_POS_TOL_M = 0.30
 RAMP_TARGET_VEL_TOL_MPS = 0.30
+MIN_TRAJECTORY_STARTUP_RAMP_S = 3.0
+DEFAULT_THRUST_SLEW_RATE_FRACTION_PER_SEC = 0.50
+DEFAULT_BODY_RATE_SLEW_RATE_RADPS2 = np.radians(240.0)
+BRAKE_DECEL_LIMIT_MPS2 = 0.25
+BRAKE_MIN_DURATION_S = 2.0
+BRAKE_MAX_DURATION_S = 8.0
+BRAKE_VEL_TOL_MPS = 0.15
 LAND_TARGET_ENU = (0.0, 0.0, 1.0)
 LAND_TARGET_YAW_ENU = 0.0
 LAND_HOLD_SEC = 2.0
@@ -112,6 +119,7 @@ class TrajectoryMode(Enum):
     WAYPOINT_HOLD = 10
     RAMP_TO_EIGHTLOOP = 11
     EIGHTLOOP = 12
+    BRAKE = 13
 
 
 class NmpcNode:
@@ -148,7 +156,10 @@ class NmpcNode:
         self.circle_radius_m = float(rospy.get_param('~circle_radius_m', 3.0))
         self.circle_period_sec = float(rospy.get_param('~circle_period_sec', 30.0))
         self.circle_hover_sec = float(rospy.get_param('~circle_hover_sec', 5.0))
-        self.circle_ramp_sec = float(rospy.get_param('~circle_ramp_sec', 8.0))
+        self.circle_ramp_sec = max(
+            float(rospy.get_param('~circle_ramp_sec', 5.0)),
+            MIN_TRAJECTORY_STARTUP_RAMP_S,
+        )
         self.circle_direction = float(rospy.get_param('~circle_direction', 1.0))
         eightloop_center_param = rospy.get_param('~eightloop_center', [0.0, 0.0, 2.0])
         eightloop_center_enu = np.array(eightloop_center_param, dtype=float)
@@ -163,7 +174,10 @@ class NmpcNode:
         self.eightloop_length_m = float(rospy.get_param('~eightloop_length_m', 3.5))
         self.eightloop_width_m = float(rospy.get_param('~eightloop_width_m', 2.0))
         self.eightloop_period_sec = float(rospy.get_param('~eightloop_period_sec', 30.0))
-        self.eightloop_ramp_sec = float(rospy.get_param('~eightloop_ramp_sec', 8.0))
+        self.eightloop_ramp_sec = max(
+            float(rospy.get_param('~eightloop_ramp_sec', 5.0)),
+            MIN_TRAJECTORY_STARTUP_RAMP_S,
+        )
         self.eightloop_direction = float(rospy.get_param('~eightloop_direction', 1.0))
         # WARNING: operator MUST keep ~takeoff_alt equal to PX4 MIS_TAKEOFF_ALT.
         # Current FC value was observed at 0.5 m and must be raised to 2.5 m before flight.
@@ -208,6 +222,18 @@ class NmpcNode:
             rospy.loginfo(f"[NMPC] Loaded platform: {self.platform_cfg.name}")
             rospy.loginfo(f"[NMPC]   mass: {self.platform_cfg.mass_kg} kg")
             rospy.loginfo(f"[NMPC]   max_thrust: {self.platform_cfg.max_thrust_n} N")
+            self.thrust_slew_rate_nps = float(rospy.get_param(
+                '~thrust_slew_rate_nps',
+                DEFAULT_THRUST_SLEW_RATE_FRACTION_PER_SEC * self.platform_cfg.max_thrust_n,
+            ))
+            self.body_rate_slew_rate_radps2 = float(rospy.get_param(
+                '~body_rate_slew_rate_radps2',
+                DEFAULT_BODY_RATE_SLEW_RATE_RADPS2,
+            ))
+            rospy.loginfo(
+                f"[NMPC]   output slew: thrust={self.thrust_slew_rate_nps:.2f} N/s, "
+                f"body_rate={np.degrees(self.body_rate_slew_rate_radps2):.1f} deg/s^2"
+            )
         except Exception as e:
             rospy.logerr(f"[NMPC] Failed to load platform config: {e}")
             raise
@@ -268,6 +294,7 @@ class NmpcNode:
         self._waypoint_index = None
         self._waypoint_hold_ref = None
         self._waypoint_hold_start = None
+        self._pending_reference_command = None
         self.arm_service = None
         self.set_mode_service = None
 
@@ -546,6 +573,65 @@ class NmpcNode:
         self._waypoint_hold_start = None
         return True
 
+    def _start_reference_command(self, command):
+        """Start the requested reference ramp after any brake phase."""
+        if command == 'go to points':
+            if not self._begin_waypoint_ramp(0):
+                return False
+            self.trajectory_mode = TrajectoryMode.WAYPOINT_RAMP
+            self._waypoint_hold_start = None
+            rospy.loginfo("[NMPC] Waypoint command accepted")
+            return True
+
+        if command == 'circle':
+            if not self._begin_ramp_to_circle():
+                return False
+            self.trajectory_mode = TrajectoryMode.RAMP_TO_CIRCLE
+            self._waypoint_hold_start = None
+            rospy.loginfo("[NMPC] Circle command accepted")
+            return True
+
+        if command == 'eightloop':
+            if not self._begin_ramp_to_eightloop():
+                return False
+            self.trajectory_mode = TrajectoryMode.RAMP_TO_EIGHTLOOP
+            self._waypoint_hold_start = None
+            rospy.loginfo("[NMPC] Eightloop command accepted")
+            return True
+
+        rospy.logwarn(f"[NMPC] Unknown reference command: {command}")
+        return False
+
+    def _begin_brake_for_reference(self, command):
+        """Brake current motion before switching to a new reference."""
+        x_now = self._build_state_vector()
+        if x_now is None:
+            rospy.logwarn("[NMPC] Brake unavailable: state unavailable")
+            return False
+
+        speed = float(np.linalg.norm(x_now[3:6]))
+        if speed <= BRAKE_VEL_TOL_MPS:
+            return self._start_reference_command(command)
+
+        brake_duration = float(np.clip(
+            speed / BRAKE_DECEL_LIMIT_MPS2,
+            BRAKE_MIN_DURATION_S,
+            BRAKE_MAX_DURATION_S,
+        ))
+        stop_pos = x_now[0:3] + 0.5 * x_now[3:6] * brake_duration
+        if not self._begin_ramp(stop_pos, np.zeros(3), x_now[8]):
+            return False
+
+        self._ramp_duration = brake_duration
+        self._pending_reference_command = command
+        self.trajectory_mode = TrajectoryMode.BRAKE
+        self._waypoint_hold_start = None
+        rospy.loginfo(
+            f"[NMPC] Braking before {command}: speed={speed:.2f} m/s, "
+            f"duration={brake_duration:.1f} s"
+        )
+        return True
+
     def _ramp_target_reached(self):
         """Return True when actual state is close enough to ramp target."""
         x_now = self._build_state_vector()
@@ -596,6 +682,7 @@ class NmpcNode:
             TrajectoryMode.RAMP_TO_HOVER,
             TrajectoryMode.LAND_APPROACH,
             TrajectoryMode.WAYPOINT_RAMP,
+            TrajectoryMode.BRAKE,
         ):
             ramp_elapsed = time.time() - self._ramp_t_start
             return np.vstack([
@@ -695,6 +782,34 @@ class NmpcNode:
         else:
             rospy.logerr(f"[NMPC] Solver: unknown status {status}")
             return False
+
+    def _apply_output_slew_limit(self, u_target):
+        """Limit change in thrust/body-rate command before publishing."""
+        dt = 1.0 / max(self.control_rate_hz, 1.0)
+        max_delta = np.array([
+            self.thrust_slew_rate_nps * dt,
+            self.body_rate_slew_rate_radps2 * dt,
+            self.body_rate_slew_rate_radps2 * dt,
+            self.body_rate_slew_rate_radps2 * dt,
+        ])
+        u_limited = self.last_control_input + np.clip(
+            u_target - self.last_control_input,
+            -max_delta,
+            max_delta,
+        )
+        u_limited[0] = np.clip(u_limited[0], 0.0, self.platform_cfg.max_thrust_n)
+        u_limited[1:4] = np.clip(
+            u_limited[1:4],
+            -self.platform_cfg.max_body_rate,
+            self.platform_cfg.max_body_rate,
+        )
+
+        if not np.allclose(u_limited, u_target, rtol=0.0, atol=1e-9):
+            rospy.loginfo_throttle(
+                1.0,
+                "[NMPC] Output slew limiting active"
+            )
+        return u_limited
 
     def _publish_attitude_target(self, u):
         """Publish attitude setpoint with body rates and thrust.
@@ -812,12 +927,13 @@ class NmpcNode:
 
         use_solution = self._handle_solver_status(status)
         publish_solution = use_solution and u_optimal is not None
-        u_to_publish = u_optimal if publish_solution else self.last_control_input
 
         if publish_solution:
-            self.last_control_input = u_optimal
+            u_to_publish = self._apply_output_slew_limit(u_optimal)
+            self.last_control_input = u_to_publish
             self.consecutive_solver_failures = 0
         else:
+            u_to_publish = self.last_control_input
             self.consecutive_solver_failures += 1
             rospy.logwarn_throttle(
                 5.0,
@@ -1226,6 +1342,7 @@ class NmpcNode:
             TrajectoryMode.EIGHTLOOP,
             TrajectoryMode.WAYPOINT_RAMP,
             TrajectoryMode.WAYPOINT_HOLD,
+            TrajectoryMode.BRAKE,
         )
 
         if self._requested_command == 'land':
@@ -1241,6 +1358,7 @@ class NmpcNode:
                 return FlightPhase.RUN
 
             self.trajectory_mode = TrajectoryMode.LAND_APPROACH
+            self._pending_reference_command = None
             self._land_hold_start = None
             self._land_descend_requested = False
             rospy.loginfo("[NMPC] Land commanded: ramping to (0,0,1)")
@@ -1253,11 +1371,8 @@ class NmpcNode:
             if self.trajectory_mode not in reference_switch_modes:
                 rospy.logwarn("[NMPC] Waypoint command ignored: current mode cannot switch")
                 return FlightPhase.RUN
-            if not self._begin_waypoint_ramp(0):
+            if not self._begin_brake_for_reference('go to points'):
                 return FlightPhase.RUN
-            self.trajectory_mode = TrajectoryMode.WAYPOINT_RAMP
-            self._waypoint_hold_start = None
-            rospy.loginfo("[NMPC] Waypoint command accepted")
 
         if self._requested_command == 'circle':
             self._requested_command = None
@@ -1267,11 +1382,8 @@ class NmpcNode:
             if self.trajectory_mode not in reference_switch_modes:
                 rospy.logwarn("[NMPC] Circle command ignored: current mode cannot switch")
                 return FlightPhase.RUN
-            if not self._begin_ramp_to_circle():
+            if not self._begin_brake_for_reference('circle'):
                 return FlightPhase.RUN
-            self.trajectory_mode = TrajectoryMode.RAMP_TO_CIRCLE
-            self._waypoint_hold_start = None
-            rospy.loginfo("[NMPC] Circle command accepted")
 
         if self._requested_command == 'eightloop':
             self._requested_command = None
@@ -1281,11 +1393,8 @@ class NmpcNode:
             if self.trajectory_mode not in reference_switch_modes:
                 rospy.logwarn("[NMPC] Eightloop command ignored: current mode cannot switch")
                 return FlightPhase.RUN
-            if not self._begin_ramp_to_eightloop():
+            if not self._begin_brake_for_reference('eightloop'):
                 return FlightPhase.RUN
-            self.trajectory_mode = TrajectoryMode.RAMP_TO_EIGHTLOOP
-            self._waypoint_hold_start = None
-            rospy.loginfo("[NMPC] Eightloop command accepted")
 
         now = time.time()
         if (
@@ -1295,11 +1404,18 @@ class NmpcNode:
                 TrajectoryMode.RAMP_TO_HOVER,
                 TrajectoryMode.LAND_APPROACH,
                 TrajectoryMode.WAYPOINT_RAMP,
+                TrajectoryMode.BRAKE,
             )
             and now - self._ramp_t_start >= self._ramp_duration
         ):
             if not self._ramp_target_reached():
                 pass
+            elif self.trajectory_mode == TrajectoryMode.BRAKE:
+                command = self._pending_reference_command
+                self._pending_reference_command = None
+                if command is None or not self._start_reference_command(command):
+                    self.trajectory_mode = TrajectoryMode.HOVER
+                    rospy.logwarn("[NMPC] Brake complete but reference start failed; entering HOVER")
             elif self.trajectory_mode == TrajectoryMode.LAND_APPROACH:
                 self.trajectory_mode = TrajectoryMode.LAND_HOLD
                 self._land_hold_start = now

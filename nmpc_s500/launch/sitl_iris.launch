@@ -13,8 +13,14 @@
     <param name="circle_radius_m" value="2.0" />
     <param name="circle_period_sec" value="30.0" />
     <param name="circle_hover_sec" value="0.0" />
-    <param name="circle_ramp_sec" value="0.0" />
+    <param name="circle_ramp_sec" value="5.0" />
     <param name="circle_direction" value="1.0" />
+    <rosparam param="eightloop_center">[0.0, 0.0, 2.0]</rosparam>
+    <param name="eightloop_length_m" value="3.5" />
+    <param name="eightloop_width_m" value="2.0" />
+    <param name="eightloop_period_sec" value="30.0" />
+    <param name="eightloop_ramp_sec" value="5.0" />
+    <param name="eightloop_direction" value="1.0" />
     <param name="hover_yaw" value="0.0" />
     <param name="control_rate_hz" value="50" />
     <param name="enable_offboard_on_start" value="true" />
