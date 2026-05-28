@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from nmpc_s500.nmpc_node import NmpcNode, POSE_VEL_SYNC_THRESHOLD_S
+from nmpc_s500.nmpc_node import FlightPhase, NmpcNode, POSE_VEL_SYNC_THRESHOLD_S
 
 
 def _pose_msg(x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
@@ -54,23 +54,43 @@ class TestStateAssembly(unittest.TestCase):
             patch("nmpc_s500.nmpc_node.rospy.init_node"),
             patch("nmpc_s500.nmpc_node.rospy.get_param", side_effect=get_param),
             patch("nmpc_s500.nmpc_node.rospy.loginfo"),
+            patch("nmpc_s500.nmpc_node.rospy.logwarn"),
             patch("nmpc_s500.nmpc_node.rospy.logwarn_throttle"),
+            patch("nmpc_s500.nmpc_node.rospy.logerr_throttle"),
             patch("nmpc_s500.nmpc_node.rospy.logerr"),
             patch("nmpc_s500.nmpc_node.rospy.Publisher", return_value=MagicMock()),
             patch("nmpc_s500.nmpc_node.rospy.Subscriber", return_value=MagicMock()),
             patch("nmpc_s500.nmpc_node.rospy.wait_for_service"),
             patch("nmpc_s500.nmpc_node.rospy.ServiceProxy", return_value=MagicMock()),
+            patch("nmpc_s500.nmpc_node.rospy.Service", return_value=MagicMock()),
             patch("nmpc_s500.nmpc_node.rospy.Duration", side_effect=lambda value: value),
             patch("nmpc_s500.nmpc_node.rospy.Timer", return_value=MagicMock()),
             patch("nmpc_s500.nmpc_node.rospy.on_shutdown"),
+            patch("nmpc_s500.nmpc_node.signal.getsignal", return_value=None),
+            patch("nmpc_s500.nmpc_node.signal.signal"),
             patch("nmpc_s500.nmpc_node.load_platform_config", return_value=platform_cfg),
             patch("nmpc_s500.nmpc_node.create_solver", return_value=MagicMock()),
         ]
 
         with ExitStack() as stack:
+            mocks = {}
             for patcher in patches:
-                stack.enter_context(patcher)
-            return NmpcNode()
+                mocked = stack.enter_context(patcher)
+                if patcher.attribute:
+                    mocks[patcher.attribute] = mocked
+            node = NmpcNode()
+            node._test_mocks = mocks
+            return node
+
+    def test_rospy_signal_handling_is_disabled_for_custom_ctrl_c_handler(self):
+        node = self._make_node()
+
+        node._test_mocks["init_node"].assert_called_once_with(
+            'nmpc_node',
+            anonymous=False,
+            disable_signals=True,
+        )
+        node._test_mocks["signal"].assert_called_once()
 
     def test_pure_east_position_and_velocity_convert_to_ned_y(self):
         """Pure ENU east maps to NED +y; FLU/ENU identity means NED yaw=pi/2."""
@@ -246,6 +266,69 @@ class TestStateAssembly(unittest.TestCase):
 
         with patch("nmpc_s500.nmpc_node.rospy.logwarn_throttle"):
             self.assertIsNone(node._build_state_vector())
+
+    def test_controlled_shutdown_request_builds_ned_staging_target(self):
+        node = self._make_node()
+        node.mavros_state = SimpleNamespace(connected=True, mode="OFFBOARD")
+        node.pose = _pose_msg(2.0, 3.0, 1.5)
+        node.velocity = _velocity_msg(0.0, 0.0, 0.0)
+        node.pose_timestamp = 10.0
+        node.vel_timestamp = 10.0
+        node.shutdown_approach_position_enu = np.array([0.0, 0.0, 1.0])
+        node.shutdown_yaw_enu = 0.0
+
+        success, message = node._request_controlled_shutdown("test")
+
+        self.assertTrue(success, message)
+        self.assertEqual(node.phase, FlightPhase.CONTROLLED_SHUTDOWN)
+        np.testing.assert_allclose(
+            node._shutdown_target_state_ned,
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, np.pi / 2],
+            atol=1e-9,
+        )
+
+    def test_shutdown_reference_reaches_staging_target_with_zero_velocity(self):
+        node = NmpcNode.__new__(NmpcNode)
+        node.control_rate_hz = 50
+        node.shutdown_approach_duration_sec = 8.0
+        node._shutdown_start_state_ned = np.array([
+            3.0, -2.0, -2.0,
+            0.4, 0.0, -0.2,
+            0.1, -0.2, -np.pi / 2,
+        ])
+        node._shutdown_target_state_ned = np.array([
+            0.0, 0.0, -1.0,
+            0.0, 0.0, 0.0,
+            0.0, 0.0, np.pi / 2,
+        ])
+
+        ref = node._shutdown_reference_at(8.0)
+
+        np.testing.assert_allclose(ref[0:6], [0.0, 0.0, -1.0, 0.0, 0.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(ref[6:9], [0.0, 0.0, np.pi / 2], atol=1e-9)
+
+    def test_controlled_shutdown_phase_continues_attitude_setpoint_publication(self):
+        node = self._make_node()
+        node.mavros_state = SimpleNamespace(connected=True, mode="OFFBOARD")
+        node.pose = _pose_msg(2.0, 0.0, 1.0)
+        node.velocity = _velocity_msg(0.0, 0.0, 0.0)
+        node.pose_timestamp = 10.0
+        node.vel_timestamp = 10.0
+        node.shutdown_approach_position_enu = np.array([0.0, 0.0, 1.0])
+        node.shutdown_yaw_enu = 0.0
+        node.solver.solve_mpc_control.return_value = (
+            np.array([[node.platform_cfg.mass_kg * 9.81, 0.0, 0.0, 0.0]]),
+            None,
+            0,
+        )
+        success, message = node._request_controlled_shutdown("test")
+        self.assertTrue(success, message)
+
+        with patch("nmpc_s500.nmpc_node.rospy.Time.now", return_value=0.0):
+            phase = node._phase_controlled_shutdown()
+
+        self.assertEqual(phase, FlightPhase.CONTROLLED_SHUTDOWN)
+        self.assertTrue(node.attitude_pub.publish.called)
 
 
 if __name__ == "__main__":

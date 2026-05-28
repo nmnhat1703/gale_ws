@@ -126,16 +126,16 @@ class QuadrotorEulerErrMPC:
 
         # Axis-specific weights let us damp XY hover oscillation without
         # disturbing the vertical hover calibration.
-        pos_xy_cost = 5e3
+        pos_xy_cost = 3000
         pos_z_cost = 5e2
-        vel_xy_cost = 5e1
+        vel_xy_cost = 100
         vel_z_cost = 2e1
         ang_cost = 1e1
         Q_mat = 2 * np.diag([pos_xy_cost, pos_xy_cost, pos_z_cost,
                              vel_xy_cost, vel_xy_cost, vel_z_cost,
                              ang_cost, ang_cost, 1e2])       # euler error (yaw weighted higher)
 
-        pos_xy_cost_e = 5e3
+        pos_xy_cost_e = 7e2
         pos_z_cost_e = 5e2
         vel_xy_cost_e = 5e1
         vel_z_cost_e = 2e1
